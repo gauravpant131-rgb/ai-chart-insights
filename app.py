@@ -13,6 +13,7 @@ st.set_page_config(
     page_title="AI Chart Insights",
     page_icon="📈",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 render_tab()

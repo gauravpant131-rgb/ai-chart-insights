@@ -2,7 +2,7 @@
 AI Chart Insights Tab
 =====================
 A drop-in Streamlit tab that gives AI-generated chart-pattern narratives and
-a classified (Bullish / Bearish / Neutral / Watch) recommendation for:
+a classified BUY / SELL / HOLD recommendation for:
   - Indian equities (NSE, via yfinance ".NS" suffix)
   - Gold (international spot proxy: COMEX Gold futures, ticker "GC=F")
   - Silver (international spot proxy: COMEX Silver futures, ticker "SI=F")
@@ -22,48 +22,54 @@ HOW TO INTEGRATE INTO YOUR EXISTING DASHBOARD
        with tab7:
            render_tab()
 
-3. Add your Anthropic API key to Streamlit secrets (Settings -> Secrets on
+3. Add your Gemini API key to Streamlit secrets (Settings -> Secrets on
    Streamlit Community Cloud, or .streamlit/secrets.toml locally):
 
-       ANTHROPIC_API_KEY = "sk-ant-..."
+       GEMINI_API_KEY = "AIza..."
 
-4. Add to requirements.txt:  anthropic, yfinance, plotly  (pandas/numpy you
+   (Get a free key at https://aistudio.google.com/apikey)
+
+4. Add to requirements.txt: google-genai, yfinance, plotly (pandas/numpy you
    already have).
 
 DESIGN NOTES
 ------------
-- Claude is asked to return strict JSON (pattern, trend, levels, recommendation,
+- Gemini is asked to return strict JSON (pattern, trend, levels, recommendation,
   confidence, rationale, risk_note) so the UI can render a clean recommendation
   badge instead of parsing free text.
 - A hard disclaimer is baked into both the system prompt and the UI -- this
   tool is for informational/educational chart reading, not investment advice.
-- Model is configurable at the top (MODEL_NAME). Sonnet gives richer
-  narratives; swap to Haiku for a faster/cheaper tab if you're calling it a
-  lot.
+- Model is configurable at the top (MODEL_NAME).
+- The free Rule-Based mode still works with zero API calls/cost, and now
+  drives its verdict off a wider indicator set (Stochastic, ADX, OBV,
+  Fibonacci retracement, volume) to produce a BUY / SELL / HOLD call.
 """
 
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 
 try:
-    import anthropic
+    from google import genai
+    from google.genai import types as genai_types
 except ImportError:
-    anthropic = None
+    genai = None
+    genai_types = None
 
 
 # ----------------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------------
 
-MODEL_NAME = "claude-sonnet-5"  # swap to "claude-haiku-4-5-20251001" for speed/cost
+MODEL_NAME = "gemini-2.5-flash"  # swap to "gemini-2.5-pro" for deeper reasoning
 AI_CACHE_TTL_SECONDS = 3600  # don't re-spend API credits re-analyzing the same snapshot within this window
 RATE_LIMIT_DELAY_SECONDS = 1.5  # pause between AI calls in a batch scan
 RATE_LIMIT_BATCH_SIZE = 10       # extra pause after every N calls, to stay well under RPM limits
@@ -96,8 +102,117 @@ INTERVAL_OPTIONS = {
 
 ANALYSIS_MODES = {
     "Free (Rule-based, no API needed)": "rule",
-    "AI Narrative (Claude API - uses credits)": "ai",
+    "AI Narrative (Gemini API - uses credits)": "ai",
 }
+
+# BUY / SELL / HOLD palette used everywhere (cards, badges, tables)
+REC_COLORS = {
+    "BUY": "#0F9D58",
+    "SELL": "#D93025",
+    "HOLD": "#F4A100",
+}
+REC_BG = {
+    "BUY": "rgba(15,157,88,0.10)",
+    "SELL": "rgba(217,48,37,0.10)",
+    "HOLD": "rgba(244,161,0,0.12)",
+}
+REC_EMOJI = {"BUY": "\U0001F4C8", "SELL": "\U0001F4C9", "HOLD": "\u23F8\uFE0F"}
+
+
+# ----------------------------------------------------------------------------
+# STYLE -- inject once per tab render for a colorful, professional GUI
+# ----------------------------------------------------------------------------
+
+def inject_custom_css():
+    st.markdown(
+        """
+        <style>
+        .aci-hero {
+            background: linear-gradient(120deg, #0f2027 0%, #203a43 45%, #2c5364 100%);
+            padding: 22px 28px;
+            border-radius: 16px;
+            color: #ffffff;
+            margin-bottom: 18px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+        }
+        .aci-hero h1 { margin: 0; font-size: 1.6em; }
+        .aci-hero p { margin: 6px 0 0 0; color: #cfe8f2; font-size: 0.95em; }
+
+        .aci-price-card {
+            background: linear-gradient(135deg, #ffffff 0%, #f4f7fb 100%);
+            border: 1px solid #e6e9f0;
+            border-radius: 14px;
+            padding: 18px 22px;
+            box-shadow: 0 4px 14px rgba(20,30,60,0.06);
+            margin-bottom: 14px;
+        }
+        .aci-price-label {
+            font-size: 0.85em;
+            color: #6b7280;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .aci-price-value {
+            font-size: 2.6em;
+            font-weight: 800;
+            line-height: 1.1;
+            margin: 2px 0;
+            color: #111827;
+        }
+        .aci-price-change {
+            font-size: 1.05em;
+            font-weight: 700;
+            padding: 2px 10px;
+            border-radius: 8px;
+            display: inline-block;
+        }
+        .aci-up { color: #0F9D58; background: rgba(15,157,88,0.10); }
+        .aci-down { color: #D93025; background: rgba(217,48,37,0.10); }
+        .aci-flat { color: #6b7280; background: rgba(107,114,128,0.10); }
+
+        .aci-rec-badge {
+            display: inline-block;
+            font-size: 1.5em;
+            font-weight: 800;
+            padding: 6px 22px;
+            border-radius: 999px;
+            letter-spacing: 0.03em;
+        }
+
+        .aci-card {
+            border-radius: 14px;
+            padding: 16px 20px;
+            margin-bottom: 12px;
+            box-shadow: 0 4px 14px rgba(20,30,60,0.06);
+        }
+        .aci-metric-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+        .aci-metric {
+            background: #f8fafc;
+            border: 1px solid #edf0f5;
+            border-radius: 10px;
+            padding: 10px 12px;
+        }
+        .aci-metric .lbl { font-size: 0.75em; color: #6b7280; font-weight: 600; text-transform: uppercase; }
+        .aci-metric .val { font-size: 1.15em; font-weight: 700; color: #111827; }
+
+        .stButton>button {
+            border-radius: 10px;
+            font-weight: 700;
+            border: none;
+            background: linear-gradient(120deg, #2c5364, #203a43);
+            color: white;
+        }
+        .stButton>button:hover { background: linear-gradient(120deg, #2c5364, #0f2027); color: #ffe8b8; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -113,6 +228,30 @@ def fetch_price_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
         df.columns = df.columns.get_level_values(0)
     df = df.dropna()
     return df
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_live_quote(ticker: str) -> dict:
+    """Best-effort near-real-time quote (fast_info), independent of the
+    historical candle cache, so the headline price refreshes more often
+    than the chart data."""
+    try:
+        t = yf.Ticker(ticker)
+        fi = t.fast_info
+        last = fi.get("last_price") or fi.get("lastPrice")
+        prev = fi.get("previous_close") or fi.get("previousClose")
+        day_high = fi.get("day_high") or fi.get("dayHigh")
+        day_low = fi.get("day_low") or fi.get("dayLow")
+        currency = fi.get("currency", "")
+        return {
+            "last_price": float(last) if last is not None else None,
+            "previous_close": float(prev) if prev is not None else None,
+            "day_high": float(day_high) if day_high is not None else None,
+            "day_low": float(day_low) if day_low is not None else None,
+            "currency": currency,
+        }
+    except Exception:
+        return {}
 
 
 # ----------------------------------------------------------------------------
@@ -139,6 +278,7 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     signal = macd.ewm(span=9, adjust=False).mean()
+    macd_hist = macd - signal
 
     mid = close.rolling(20).mean()
     std = close.rolling(20).std()
@@ -152,28 +292,78 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     ], axis=1).max(axis=1)
     atr14 = tr.rolling(14).mean()
 
+    # --- Stochastic Oscillator (%K, %D) ---
+    low14 = low.rolling(14).min()
+    high14 = high.rolling(14).max()
+    stoch_k = 100 * (close - low14) / (high14 - low14).replace(0, np.nan)
+    stoch_d = stoch_k.rolling(3).mean()
+
+    # --- ADX (trend strength) ---
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr_smooth = tr.rolling(14).sum().replace(0, np.nan)
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(14).sum() / tr_smooth
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(14).sum() / tr_smooth
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx14 = dx.rolling(14).mean()
+
+    # --- On-Balance Volume (trend of volume-weighted flow) ---
+    if not vol.empty:
+        obv = (np.sign(close.diff().fillna(0)) * vol).fillna(0).cumsum()
+        obv_sma20 = obv.rolling(20).mean()
+        obv_rising = bool(obv.iloc[-1] > obv_sma20.iloc[-1]) if pd.notna(obv_sma20.iloc[-1]) else None
+    else:
+        obv_rising = None
+
+    # --- Fibonacci retracement over the recent swing ---
     lookback = min(60, len(df))
     recent = df.tail(lookback)
-    swing_high = recent["High"].max()
-    swing_low = recent["Low"].min()
+    swing_high = float(recent["High"].max())
+    swing_low = float(recent["Low"].min())
+    span = swing_high - swing_low
+    fib_levels = {
+        "0.0%": round(swing_high, 2),
+        "23.6%": round(swing_high - 0.236 * span, 2),
+        "38.2%": round(swing_high - 0.382 * span, 2),
+        "50.0%": round(swing_high - 0.5 * span, 2),
+        "61.8%": round(swing_high - 0.618 * span, 2),
+        "100%": round(swing_low, 2),
+    } if span > 0 else {}
 
     last_close = float(close.iloc[-1])
     vol_avg20 = float(vol.rolling(20).mean().iloc[-1]) if not vol.empty else None
     vol_last = float(vol.iloc[-1]) if not vol.empty else None
+    vol_ratio = round(vol_last / vol_avg20, 2) if (vol_last and vol_avg20) else None
+
+    def _safe(series):
+        try:
+            v = series.iloc[-1]
+            return round(float(v), 2) if pd.notna(v) else None
+        except Exception:
+            return None
 
     return {
         "last_close": round(last_close, 2),
-        "sma20": round(float(sma20.iloc[-1]), 2) if not np.isnan(sma20.iloc[-1]) else None,
-        "sma50": round(float(sma50.iloc[-1]), 2) if not np.isnan(sma50.iloc[-1]) else None,
-        "sma200": round(float(sma200.iloc[-1]), 2) if len(df) >= 200 and not np.isnan(sma200.iloc[-1]) else None,
-        "rsi14": round(float(rsi14.iloc[-1]), 1) if not np.isnan(rsi14.iloc[-1]) else None,
-        "macd": round(float(macd.iloc[-1]), 3) if not np.isnan(macd.iloc[-1]) else None,
-        "macd_signal": round(float(signal.iloc[-1]), 3) if not np.isnan(signal.iloc[-1]) else None,
-        "bb_upper": round(float(bb_upper.iloc[-1]), 2) if not np.isnan(bb_upper.iloc[-1]) else None,
-        "bb_lower": round(float(bb_lower.iloc[-1]), 2) if not np.isnan(bb_lower.iloc[-1]) else None,
-        "atr14": round(float(atr14.iloc[-1]), 2) if not np.isnan(atr14.iloc[-1]) else None,
-        "swing_high_60d": round(float(swing_high), 2),
-        "swing_low_60d": round(float(swing_low), 2),
+        "sma20": _safe(sma20),
+        "sma50": _safe(sma50),
+        "sma200": _safe(sma200) if len(df) >= 200 else None,
+        "rsi14": _safe(rsi14),
+        "macd": round(float(macd.iloc[-1]), 3) if pd.notna(macd.iloc[-1]) else None,
+        "macd_signal": round(float(signal.iloc[-1]), 3) if pd.notna(signal.iloc[-1]) else None,
+        "macd_hist": round(float(macd_hist.iloc[-1]), 3) if pd.notna(macd_hist.iloc[-1]) else None,
+        "bb_upper": _safe(bb_upper),
+        "bb_lower": _safe(bb_lower),
+        "atr14": _safe(atr14),
+        "stoch_k": _safe(stoch_k),
+        "stoch_d": _safe(stoch_d),
+        "adx14": _safe(adx14),
+        "obv_rising": obv_rising,
+        "vol_ratio_vs_avg20": vol_ratio,
+        "fib_levels": fib_levels,
+        "swing_high_60d": round(swing_high, 2),
+        "swing_low_60d": round(swing_low, 2),
         "vol_last": vol_last,
         "vol_avg20": vol_avg20,
     }, {"sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower}
@@ -185,15 +375,22 @@ def compute_indicators(df: pd.DataFrame) -> dict:
 
 def rule_based_insight(indicators: dict) -> dict:
     """Produces the exact same schema as the AI insight, but derived entirely
-    from coded technical rules -- zero API calls, zero cost."""
+    from coded technical rules across a wider indicator set -- zero API
+    calls, zero cost. Outputs an explicit BUY / SELL / HOLD call."""
     last_close = indicators.get("last_close")
     sma20 = indicators.get("sma20")
     sma50 = indicators.get("sma50")
+    sma200 = indicators.get("sma200")
     rsi = indicators.get("rsi14")
     macd = indicators.get("macd")
     macd_signal = indicators.get("macd_signal")
     bb_upper = indicators.get("bb_upper")
     bb_lower = indicators.get("bb_lower")
+    stoch_k = indicators.get("stoch_k")
+    stoch_d = indicators.get("stoch_d")
+    adx = indicators.get("adx14")
+    obv_rising = indicators.get("obv_rising")
+    vol_ratio = indicators.get("vol_ratio_vs_avg20")
     swing_high = indicators.get("swing_high_60d")
     swing_low = indicators.get("swing_low_60d")
     atr = indicators.get("atr14")
@@ -213,6 +410,12 @@ def rule_based_insight(indicators: dict) -> dict:
     else:
         trend = "Sideways/Range-bound"
         signals.append(("Not enough history yet for a full moving-average read", 0))
+
+    if sma200 is not None and last_close is not None:
+        if last_close > sma200:
+            signals.append(("Price above long-term SMA200 (bullish backdrop)", 1))
+        else:
+            signals.append(("Price below long-term SMA200 (bearish backdrop)", -1))
 
     if rsi is not None:
         if rsi >= 70:
@@ -235,17 +438,50 @@ def rule_based_insight(indicators: dict) -> dict:
         elif band_pos <= 0.05:
             signals.append(("Price is testing the lower Bollinger Band", 1))
 
+    if stoch_k is not None and stoch_d is not None:
+        if stoch_k >= 80:
+            signals.append((f"Stochastic %K at {stoch_k} signals overbought", -1))
+        elif stoch_k <= 20:
+            signals.append((f"Stochastic %K at {stoch_k} signals oversold", 1))
+        elif stoch_k > stoch_d:
+            signals.append(("Stochastic %K crossing above %D (early bullish)", 1))
+        else:
+            signals.append(("Stochastic %K crossing below %D (early bearish)", -1))
+
+    if adx is not None:
+        if adx >= 25:
+            # ADX confirms trend strength -- amplify the prevailing trend direction
+            if trend == "Uptrend":
+                signals.append((f"ADX at {adx} confirms a strong trend (supports the uptrend)", 1))
+            elif trend == "Downtrend":
+                signals.append((f"ADX at {adx} confirms a strong trend (supports the downtrend)", -1))
+            else:
+                signals.append((f"ADX at {adx} shows a strong trend despite mixed averages", 0))
+        else:
+            signals.append((f"ADX at {adx} shows a weak/choppy trend", 0))
+
+    if obv_rising is not None:
+        if obv_rising:
+            signals.append(("On-Balance Volume is rising (buying pressure)", 1))
+        else:
+            signals.append(("On-Balance Volume is falling (selling pressure)", -1))
+
+    if vol_ratio is not None and vol_ratio >= 1.5:
+        # High relative volume amplifies whatever the prevailing short-term move is
+        if macd is not None and macd_signal is not None and macd > macd_signal:
+            signals.append((f"Volume is {vol_ratio}x the 20-day average, confirming upside move", 1))
+        elif macd is not None and macd_signal is not None:
+            signals.append((f"Volume is {vol_ratio}x the 20-day average, confirming downside move", -1))
+
     directions = [d for _, d in signals if d != 0]
     score = sum(directions)
 
-    if score >= 2:
-        recommendation = "Bullish"
-    elif score <= -2:
-        recommendation = "Bearish"
-    elif score == 0 and directions:
-        recommendation = "Neutral"
+    if score >= 3:
+        recommendation = "BUY"
+    elif score <= -3:
+        recommendation = "SELL"
     else:
-        recommendation = "Watch"
+        recommendation = "HOLD"
 
     if directions:
         pos_count = sum(1 for d in directions if d > 0)
@@ -253,7 +489,7 @@ def rule_based_insight(indicators: dict) -> dict:
         total = len(directions)
         if pos_count == total or neg_count == total:
             confidence = "High"
-        elif abs(pos_count - neg_count) >= 1:
+        elif abs(pos_count - neg_count) / total >= 0.4:
             confidence = "Medium"
         else:
             confidence = "Low"
@@ -262,7 +498,7 @@ def rule_based_insight(indicators: dict) -> dict:
 
     pattern_bits = [desc for desc, _ in signals]
     pattern_identified = "; ".join(pattern_bits) if pattern_bits else "No clear pattern - insufficient data"
-    rationale = "Rule-based technical read: " + "; ".join(pattern_bits) + "."
+    rationale = "Rule-based technical read across trend, momentum, volatility and volume: " + "; ".join(pattern_bits) + "."
 
     risk_note = "Automated rule-based technical read (no AI narrative) -- not investment advice."
     if atr is not None and last_close:
@@ -278,6 +514,7 @@ def rule_based_insight(indicators: dict) -> dict:
         "confidence": confidence,
         "rationale": rationale,
         "risk_note": risk_note,
+        "signal_score": score,
     }
 
 
@@ -285,31 +522,104 @@ def rule_based_insight(indicators: dict) -> dict:
 # CHART
 # ----------------------------------------------------------------------------
 
-def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str) -> go.Figure:
-    fig = go.Figure()
+def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str, fib_levels: dict = None) -> go.Figure:
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25],
+        vertical_spacing=0.03,
+    )
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        name="Price", increasing_line_color="#0B6623", decreasing_line_color="#B22222",
-    ))
+        name="Price", increasing_line_color="#0F9D58", decreasing_line_color="#D93025",
+    ), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=overlays["sma20"], name="SMA 20",
-                              line=dict(color="#1f77b4", width=1)))
+                              line=dict(color="#2c5364", width=1.4)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=overlays["sma50"], name="SMA 50",
-                              line=dict(color="#ff7f0e", width=1)))
+                              line=dict(color="#F4A100", width=1.4)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=overlays["bb_upper"], name="BB Upper",
-                              line=dict(color="rgba(150,150,150,0.5)", width=1, dash="dot")))
+                              line=dict(color="rgba(120,120,140,0.55)", width=1, dash="dot")), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=overlays["bb_lower"], name="BB Lower",
-                              line=dict(color="rgba(150,150,150,0.5)", width=1, dash="dot"),
-                              fill="tonexty", fillcolor="rgba(150,150,150,0.07)"))
+                              line=dict(color="rgba(120,120,140,0.55)", width=1, dash="dot"),
+                              fill="tonexty", fillcolor="rgba(44,83,100,0.06)"), row=1, col=1)
+
+    if fib_levels:
+        fib_colors = ["#9AA5B1", "#7C8CA6", "#5E7CE2", "#F4A100", "#D93025", "#9AA5B1"]
+        for (label, level), color in zip(fib_levels.items(), fib_colors):
+            fig.add_hline(y=level, line=dict(color=color, width=0.8, dash="dot"),
+                          annotation_text=f"Fib {label}", annotation_position="right",
+                          annotation_font_size=9, row=1, col=1)
+
+    if "Volume" in df.columns:
+        vol_colors = np.where(df["Close"] >= df["Open"], "#0F9D58", "#D93025")
+        fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume",
+                              marker_color=vol_colors, opacity=0.6), row=2, col=1)
+
     fig.update_layout(
-        title=title, xaxis_rangeslider_visible=False, height=520,
+        title=title, xaxis_rangeslider_visible=False, height=600,
         margin=dict(l=10, r=10, t=40, b=10), template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor="rgba(250,251,253,1)",
     )
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
     return fig
 
 
 # ----------------------------------------------------------------------------
-# CLAUDE CALL
+# LIVE PRICE HEADER -- big, bold, unmissable
+# ----------------------------------------------------------------------------
+
+def render_price_header(ticker: str, asset_label: str, fallback_close: float, fallback_prev: float = None):
+    quote = fetch_live_quote(ticker)
+    last_price = quote.get("last_price") or fallback_close
+    prev_close = quote.get("previous_close") or fallback_prev
+    currency = quote.get("currency") or ("INR" if ticker.endswith(".NS") else "USD")
+    symbol_map = {"INR": "\u20B9", "USD": "$"}
+    ccy_symbol = symbol_map.get(currency, currency + " ")
+
+    change, pct = None, None
+    if last_price is not None and prev_close:
+        change = last_price - prev_close
+        pct = (change / prev_close) * 100
+
+    if change is None:
+        change_html = ""
+    elif change > 0:
+        change_html = f'<span class="aci-price-change aci-up">\u25B2 {ccy_symbol}{change:,.2f} ({pct:+.2f}%)</span>'
+    elif change < 0:
+        change_html = f'<span class="aci-price-change aci-down">\u25BC {ccy_symbol}{abs(change):,.2f} ({pct:+.2f}%)</span>'
+    else:
+        change_html = '<span class="aci-price-change aci-flat">\u2014 No change</span>'
+
+    day_range = ""
+    if quote.get("day_low") and quote.get("day_high"):
+        day_range = (f'<div class="aci-metric"><div class="lbl">Day Range</div>'
+                     f'<div class="val">{ccy_symbol}{quote["day_low"]:,.2f} \u2013 {ccy_symbol}{quote["day_high"]:,.2f}</div></div>')
+
+    prev_html = ""
+    if prev_close:
+        prev_html = (f'<div class="aci-metric"><div class="lbl">Prev Close</div>'
+                     f'<div class="val">{ccy_symbol}{prev_close:,.2f}</div></div>')
+
+    price_str = f"{ccy_symbol}{last_price:,.2f}" if last_price is not None else "N/A"
+
+    st.markdown(
+        f"""
+        <div class="aci-price-card">
+            <div class="aci-price-label">{asset_label} &middot; {ticker}</div>
+            <div class="aci-price-value">{price_str}</div>
+            {change_html}
+            <div class="aci-metric-grid">
+                {prev_html}
+                {day_range}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ----------------------------------------------------------------------------
+# GEMINI CALL
 # ----------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """You are a technical analysis assistant embedded in a personal investing \
@@ -320,10 +630,10 @@ Rules:
 - Base your read strictly on the numeric data given. Do not invent price history you weren't given.
 - Identify classical chart/technical patterns only if the data genuinely supports them \
 (e.g. uptrend/downtrend, consolidation, breakout above resistance, oversold/overbought, \
-moving average crossover, Bollinger squeeze). Do not force a pattern name if none fits -- \
-say the structure is unclear or range-bound instead.
-- Your recommendation field is a technical-stance classification, not investment advice. \
-Always include a risk_note.
+moving average crossover, Bollinger squeeze, Fibonacci confluence). Do not force a pattern \
+name if none fits -- say the structure is unclear or range-bound instead.
+- Your recommendation field is a technical-stance classification (BUY / SELL / HOLD), not \
+investment advice. Always include a risk_note.
 - Return ONLY valid JSON, no markdown fences, no preamble, matching exactly this schema:
 
 {
@@ -331,7 +641,7 @@ Always include a risk_note.
   "trend": "Uptrend | Downtrend | Sideways/Range-bound",
   "key_support": number or null,
   "key_resistance": number or null,
-  "recommendation": "Bullish | Bearish | Neutral | Watch",
+  "recommendation": "BUY | SELL | HOLD",
   "confidence": "High | Medium | Low",
   "rationale": "2-4 sentences explaining the read, referencing the specific indicator values given",
   "risk_note": "1-2 sentences on what would invalidate this read or key risk"
@@ -339,15 +649,15 @@ Always include a risk_note.
 """
 
 
-def call_claude_for_insight(symbol: str, asset_label: str, indicators: dict, interval: str) -> dict:
-    if anthropic is None:
-        raise RuntimeError("The 'anthropic' package is not installed. Add it to requirements.txt.")
+def call_gemini_for_insight(symbol: str, asset_label: str, indicators: dict, interval: str) -> dict:
+    if genai is None:
+        raise RuntimeError("The 'google-genai' package is not installed. Add it to requirements.txt.")
 
-    api_key = st.secrets.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY"))
+    api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not found in st.secrets or environment.")
+        raise RuntimeError("GEMINI_API_KEY not found in st.secrets or environment.")
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = genai.Client(api_key=api_key)
 
     user_prompt = f"""Asset: {asset_label} ({symbol})
 Timeframe: {interval} candles
@@ -360,22 +670,21 @@ Give your read as JSON per the schema."""
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
-            resp = client.messages.create(
+            resp = client.models.generate_content(
                 model=MODEL_NAME,
-                max_tokens=600,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_prompt}],
+                contents=user_prompt,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    max_output_tokens=700,
+                ),
             )
-            text = "".join(block.text for block in resp.content if block.type == "text").strip()
+            text = (resp.text or "").strip()
             text = text.replace("```json", "").replace("```", "").strip()
             return json.loads(text)
-        except anthropic.RateLimitError as e:
+        except Exception as e:
             last_error = e
-            wait = (2 ** attempt) * RATE_LIMIT_DELAY_SECONDS
-            time.sleep(wait)
-        except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
-            last_error = e
-            time.sleep(RATE_LIMIT_DELAY_SECONDS)
+            time.sleep((2 ** attempt) * RATE_LIMIT_DELAY_SECONDS)
 
     raise RuntimeError(f"AI call failed after {MAX_RETRIES} attempts: {last_error}")
 
@@ -384,10 +693,10 @@ Give your read as JSON per the schema."""
 def _cached_ai_insight(symbol: str, asset_label: str, indicators_json: str, interval: str, model_name: str) -> dict:
     """Cache wrapper keyed on the actual indicator values (as a JSON string, so it's
     hashable). Identical indicator snapshots within AI_CACHE_TTL_SECONDS reuse the
-    previous Claude response instead of paying for a fresh API call. A genuinely new
+    previous Gemini response instead of paying for a fresh API call. A genuinely new
     price snapshot (different indicators) produces a different cache key automatically."""
     indicators = json.loads(indicators_json)
-    return call_claude_for_insight(symbol, asset_label, indicators, interval)
+    return call_gemini_for_insight(symbol, asset_label, indicators, interval)
 
 
 def get_ai_insight(symbol: str, asset_label: str, indicators: dict, interval: str, force_refresh: bool = False) -> dict:
@@ -408,43 +717,73 @@ def get_insight(mode: str, symbol: str, asset_label: str, indicators: dict, inte
 # UI HELPERS
 # ----------------------------------------------------------------------------
 
-REC_COLORS = {
-    "Bullish": "#0B6623",
-    "Bearish": "#B22222",
-    "Neutral": "#8a8a3c",
-    "Watch": "#B8860B",
-}
-
-
 def render_recommendation_card(insight: dict):
-    rec = insight.get("recommendation", "Watch")
-    color = REC_COLORS.get(rec, "#555555")
+    rec = str(insight.get("recommendation", "HOLD")).upper()
+    if rec not in REC_COLORS:
+        rec = "HOLD"
+    color = REC_COLORS[rec]
+    bg = REC_BG[rec]
+    emoji = REC_EMOJI[rec]
+
     st.markdown(
         f"""
-        <div style="border-left: 6px solid {color}; padding: 12px 16px;
-                    background: rgba(0,0,0,0.03); border-radius: 6px; margin-bottom: 10px;">
-            <span style="font-size: 1.1em; font-weight: 700; color: {color};">
-                {rec}
-            </span>
-            <span style="margin-left: 10px; color: #666;">
+        <div class="aci-card" style="background:{bg}; border-left: 8px solid {color};">
+            <span class="aci-rec-badge" style="background:{color}; color:white;">{emoji} {rec}</span>
+            <span style="margin-left: 14px; color: #444; font-weight: 600;">
                 Confidence: {insight.get('confidence', 'n/a')}
             </span>
-            <div style="margin-top: 8px; font-weight: 600;">
+            <div style="margin-top: 12px; font-weight: 700; color:#1f2937;">
                 {insight.get('pattern_identified', '')}
             </div>
-            <div style="margin-top: 4px; color: #333;">
-                Trend: {insight.get('trend', 'n/a')} &nbsp;|&nbsp;
-                Support: {insight.get('key_support', 'n/a')} &nbsp;|&nbsp;
-                Resistance: {insight.get('key_resistance', 'n/a')}
+            <div style="margin-top: 6px; color: #374151;">
+                Trend: <b>{insight.get('trend', 'n/a')}</b> &nbsp;|&nbsp;
+                Support: <b>{insight.get('key_support', 'n/a')}</b> &nbsp;|&nbsp;
+                Resistance: <b>{insight.get('key_resistance', 'n/a')}</b>
             </div>
-            <div style="margin-top: 8px;">{insight.get('rationale', '')}</div>
-            <div style="margin-top: 8px; font-style: italic; color: #777; font-size: 0.9em;">
-                Risk: {insight.get('risk_note', '')}
+            <div style="margin-top: 10px; color:#1f2937;">{insight.get('rationale', '')}</div>
+            <div style="margin-top: 8px; font-style: italic; color: #6b7280; font-size: 0.9em;">
+                \u26A0\uFE0F Risk: {insight.get('risk_note', '')}
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_indicator_grid(ind: dict):
+    def fmt(v, suffix=""):
+        return f"{v}{suffix}" if v is not None else "\u2014"
+
+    items = [
+        ("SMA 20", fmt(ind.get("sma20"))),
+        ("SMA 50", fmt(ind.get("sma50"))),
+        ("SMA 200", fmt(ind.get("sma200"))),
+        ("RSI (14)", fmt(ind.get("rsi14"))),
+        ("MACD", fmt(ind.get("macd"))),
+        ("MACD Signal", fmt(ind.get("macd_signal"))),
+        ("Stoch %K", fmt(ind.get("stoch_k"))),
+        ("Stoch %D", fmt(ind.get("stoch_d"))),
+        ("ADX (14)", fmt(ind.get("adx14"))),
+        ("ATR (14)", fmt(ind.get("atr14"))),
+        ("OBV Trend", "Rising \U0001F4C8" if ind.get("obv_rising") else ("Falling \U0001F4C9" if ind.get("obv_rising") is False else "\u2014")),
+        ("Volume vs 20d Avg", fmt(ind.get("vol_ratio_vs_avg20"), "x")),
+        ("60D Support", fmt(ind.get("swing_low_60d"))),
+        ("60D Resistance", fmt(ind.get("swing_high_60d"))),
+    ]
+    html = '<div class="aci-metric-grid">'
+    for label, val in items:
+        html += f'<div class="aci-metric"><div class="lbl">{label}</div><div class="val">{val}</div></div>'
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+    fib = ind.get("fib_levels")
+    if fib:
+        st.markdown("**Fibonacci retracement (last 60 candles):**")
+        fib_html = '<div class="aci-metric-grid">'
+        for label, level in fib.items():
+            fib_html += f'<div class="aci-metric"><div class="lbl">{label}</div><div class="val">{level}</div></div>'
+        fib_html += "</div>"
+        st.markdown(fib_html, unsafe_allow_html=True)
 
 
 # ----------------------------------------------------------------------------
@@ -472,7 +811,7 @@ def render_single_asset():
     with col3:
         interval_label = st.selectbox("Interval", list(INTERVAL_OPTIONS.keys()))
 
-    fetch_clicked = st.button("Fetch Chart", type="primary")
+    fetch_clicked = st.button("\U0001F50D Fetch Chart", type="primary")
 
     state_key = "ai_chart_df"
     if fetch_clicked and ticker:
@@ -494,11 +833,15 @@ def render_single_asset():
         )
 
         indicators, overlays = compute_indicators(df)
-        fig = build_candlestick_chart(df, overlays, f"{asset_label} ({ticker})")
+
+        prev_close = float(df["Close"].iloc[-2]) if len(df) > 1 else None
+        render_price_header(ticker, asset_label, indicators["last_close"], prev_close)
+
+        fig = build_candlestick_chart(df, overlays, f"{asset_label} ({ticker})", indicators.get("fib_levels"))
         st.plotly_chart(fig, use_container_width=True)
 
-        with st.expander("Latest technical snapshot"):
-            st.json(indicators)
+        with st.expander("\U0001F4CA Full technical snapshot (all indicators)", expanded=True):
+            render_indicator_grid(indicators)
 
         mode_label = st.radio(
             "Analysis mode", list(ANALYSIS_MODES.keys()), horizontal=True, key="single_mode"
@@ -507,7 +850,7 @@ def render_single_asset():
 
         btn_col, refresh_col = st.columns([2, 1])
         with btn_col:
-            btn_label = "Get Insight" if mode == "rule" else "Get AI Insight"
+            btn_label = "\u26A1 Get Insight" if mode == "rule" else "\U0001F916 Get AI Insight"
             get_insight_clicked = st.button(btn_label, type="primary")
         with refresh_col:
             force_refresh = st.checkbox(
@@ -517,10 +860,10 @@ def render_single_asset():
             )
 
         if get_insight_clicked:
-            if mode == "ai" and anthropic is None:
-                st.error("Install the `anthropic` package and add it to requirements.txt, or switch to Free (Rule-based) mode.")
+            if mode == "ai" and genai is None:
+                st.error("Install the `google-genai` package and add it to requirements.txt, or switch to Free (Rule-based) mode.")
             else:
-                spinner_msg = "Running rule-based analysis..." if mode == "rule" else "Analyzing chart with Claude..."
+                spinner_msg = "Running rule-based analysis..." if mode == "rule" else "Analyzing chart with Gemini..."
                 with st.spinner(spinner_msg):
                     try:
                         insight = get_insight(mode, ticker, asset_label, indicators, interval_label, force_refresh)
@@ -534,21 +877,21 @@ def render_single_asset():
             used_mode = st.session_state.get("ai_chart_insight_mode", mode)
             if used_mode == "rule":
                 st.caption(
-                    f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')} · Free rule-based engine, no API used · "
-                    "For informational purposes only, not investment advice."
+                    f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')} \u00b7 Free rule-based engine, no API used \u00b7 "
+                    "For informational/educational purposes only, not investment advice."
                 )
             else:
                 st.caption(
-                    f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')} · Model: {MODEL_NAME} · "
-                    f"Cached for {AI_CACHE_TTL_SECONDS // 60} min per unique snapshot · "
-                    "For informational purposes only, not investment advice."
+                    f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')} \u00b7 Model: {MODEL_NAME} \u00b7 "
+                    f"Cached for {AI_CACHE_TTL_SECONDS // 60} min per unique snapshot \u00b7 "
+                    "For informational/educational purposes only, not investment advice."
                 )
     else:
         st.info("Select an asset and click 'Fetch Chart' to begin.")
 
 
 # ----------------------------------------------------------------------------
-# WATCHLIST SCAN -- run AI insight across many symbols at once
+# WATCHLIST SCAN -- run insight across many symbols at once
 # ----------------------------------------------------------------------------
 
 def _resolve_watchlist_ticker(raw: str) -> tuple:
@@ -578,7 +921,7 @@ def render_watchlist():
         f"{AI_CACHE_TTL_SECONDS // 60} minutes, so re-running the scan on unchanged charts costs no extra API calls."
     )
 
-    with st.expander("📂 Load symbols from your portfolio Excel", expanded=False):
+    with st.expander("\U0001F4C2 Load symbols from your portfolio Excel", expanded=False):
         uploaded = st.file_uploader(
             "Upload your portfolio workbook (.xlsx)", type=["xlsx", "xls", "csv"], key="wl_portfolio_upload"
         )
@@ -649,7 +992,7 @@ def render_watchlist():
     if mode == "rule":
         st.caption("Free mode: no API calls, no rate limiting needed -- scans run at full speed.")
 
-    run_clicked = st.button("Run Watchlist Scan", type="primary")
+    run_clicked = st.button("\u25B6\uFE0F Run Watchlist Scan", type="primary")
 
     if run_clicked:
         tokens = [s for s in symbols_raw.split(",") if s.strip()]
@@ -715,7 +1058,7 @@ def render_watchlist():
         summary_df = pd.DataFrame(summary_rows)
 
         def _color_rec(val):
-            color = REC_COLORS.get(val)
+            color = REC_COLORS.get(str(val).upper())
             return f"color: {color}; font-weight: 700;" if color else ""
 
         st.dataframe(
@@ -728,7 +1071,9 @@ def render_watchlist():
             if "Error" in r:
                 st.warning(f"{r['Symbol']}: {r['Error']}")
                 continue
-            with st.expander(f"{r['Symbol']} — {r['Recommendation']} ({r['Confidence']} confidence)"):
+            rec = str(r.get("Recommendation", "HOLD")).upper()
+            emoji = REC_EMOJI.get(rec, "")
+            with st.expander(f"{emoji} {r['Symbol']} \u2014 {rec} ({r['Confidence']} confidence)"):
                 st.write(f"**Pattern:** {r['Pattern']}")
                 st.write(f"**Trend:** {r['Trend']} | **Support:** {r['Support']} | **Resistance:** {r['Resistance']}")
                 st.write(r["Rationale"])
@@ -737,12 +1082,12 @@ def render_watchlist():
         used_mode = st.session_state.get("watchlist_mode", mode)
         if used_mode == "rule":
             st.caption(
-                f"Scan run: {datetime.now().strftime('%d %b %Y, %H:%M')} · Free rule-based engine, no API used · "
+                f"Scan run: {datetime.now().strftime('%d %b %Y, %H:%M')} \u00b7 Free rule-based engine, no API used \u00b7 "
                 "For informational purposes only, not investment advice."
             )
         else:
             st.caption(
-                f"Scan run: {datetime.now().strftime('%d %b %Y, %H:%M')} · Model: {MODEL_NAME} · "
+                f"Scan run: {datetime.now().strftime('%d %b %Y, %H:%M')} \u00b7 Model: {MODEL_NAME} \u00b7 "
                 "For informational purposes only, not investment advice."
             )
     else:
@@ -754,14 +1099,20 @@ def render_watchlist():
 # ----------------------------------------------------------------------------
 
 def render_tab():
-    st.subheader("🤖 AI Chart Insights")
-    st.caption(
-        "AI-generated technical reads for stocks, gold and silver charts. "
-        "This is informational chart analysis, not investment advice -- always do your own "
-        "due diligence and consider consulting a SEBI-registered advisor before acting."
+    inject_custom_css()
+    st.markdown(
+        """
+        <div class="aci-hero">
+            <h1>\U0001F916\U0001F4C8 AI Chart Insights</h1>
+            <p>Live price tracking + AI &amp; rule-based technical reads for NSE/BSE stocks, Gold and Silver.
+            Educational and research use only \u2014 not investment advice, always do your own due diligence or
+            consult a SEBI-registered advisor before acting.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    sub_tab1, sub_tab2 = st.tabs(["Single Asset", "Watchlist Scan"])
+    sub_tab1, sub_tab2 = st.tabs(["\U0001F4CD Single Asset", "\U0001F4CB Watchlist Scan"])
     with sub_tab1:
         render_single_asset()
     with sub_tab2:
