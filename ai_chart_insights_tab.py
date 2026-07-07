@@ -1061,8 +1061,12 @@ def render_watchlist():
             color = REC_COLORS.get(str(val).upper())
             return f"color: {color}; font-weight: 700;" if color else ""
 
+        styler = summary_df.style
+        # pandas >=2.1 renamed Styler.applymap -> Styler.map (applymap was removed
+        # entirely in pandas 3.0). Use whichever this environment has.
+        style_fn = getattr(styler, "map", None) or getattr(styler, "applymap")
         st.dataframe(
-            summary_df.style.applymap(_color_rec, subset=["Recommendation"]),
+            style_fn(_color_rec, subset=["Recommendation"]),
             use_container_width=True,
             hide_index=True,
         )
