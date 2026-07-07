@@ -38,12 +38,18 @@ def fetch_data(ticker):
     df = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=True)
     return df.dropna() if not df.empty else df
 
-def compute_indicators(df):
+def compute_indidef compute_indicators(df):
     close = df["Close"]
+    # Calculate SMA and take only the last value (iloc[-1])
     sma20 = close.rolling(20).mean().iloc[-1]
     sma50 = close.rolling(50).mean().iloc[-1]
-    return {"last_close": float(close.iloc[-1]), "sma20": float(sma20), "sma50": float(sma50)}
-
+    
+    # Ensure these are standard Python floats
+    return {
+        "last_close": float(close.iloc[-1]), 
+        "sma20": float(sma20), 
+        "sma50": float(sma50)
+    }
 # --- UI ---
 def render_tab():
     st.title("📈 AI Market Insight Pro")
