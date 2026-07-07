@@ -1,0 +1,621 @@
+"""
+AI Chart Insights Tab
+=====================
+A drop-in Streamlit tab that gives AI-generated chart-pattern narratives and
+a classified (Bullish / Bearish / Neutral / Watch) recommendation for:
+  - Indian equities (NSE, via yfinance ".NS" suffix)
+  - Gold (international spot proxy: COMEX Gold futures, ticker "GC=F")
+  - Silver (international spot proxy: COMEX Silver futures, ticker "SI=F")
+
+HOW TO INTEGRATE INTO YOUR EXISTING DASHBOARD
+----------------------------------------------
+1. Copy this file into your project folder (same folder as app.py).
+2. In your main app.py, where you define your tabs, e.g.:
+
+       tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+           "Ratings", "Backtest", "Portfolio", ..., "AI Chart Insights"
+       ])
+
+   add one more tab and call:
+
+       from ai_chart_insights_tab import render_tab
+       with tab7:
+           render_tab()
+
+3. Add your Anthropic API key to Streamlit secrets (Settings -> Secrets on
+   Streamlit Community Cloud, or .streamlit/secrets.toml locally):
+
+       ANTHROPIC_API_KEY = "sk-ant-..."
+
+4. Add to requirements.txt:  anthropic, yfinance, plotly  (pandas/numpy you
+   already have).
+
+DESIGN NOTES
+------------
+- Claude is asked to return strict JSON (pattern, trend, levels, recommendation,
+  confidence, rationale, risk_note) so the UI can render a clean recommendation
+  badge instead of parsing free text.
+- A hard disclaimer is baked into both the system prompt and the UI -- this
+  tool is for informational/educational chart reading, not investment advice.
+- Model is configurable at the top (MODEL_NAME). Sonnet gives richer
+  narratives; swap to Haiku for a faster/cheaper tab if you're calling it a
+  lot.
+"""
+
+import json
+import os
+import time
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+
+# ----------------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------------
+
+MODEL_NAME = "claude-sonnet-5"  # swap to "claude-haiku-4-5-20251001" for speed/cost
+AI_CACHE_TTL_SECONDS = 3600  # don't re-spend API credits re-analyzing the same snapshot within this window
+RATE_LIMIT_DELAY_SECONDS = 1.5  # pause between AI calls in a batch scan
+RATE_LIMIT_BATCH_SIZE = 10       # extra pause after every N calls, to stay well under RPM limits
+RATE_LIMIT_BATCH_PAUSE_SECONDS = 6
+MAX_RETRIES = 3
+
+ASSET_PRESETS = {
+    "Indian Stock": None,  # user types the symbol
+    "Gold (Intl Spot proxy - COMEX futures)": "GC=F",
+    "Silver (Intl Spot proxy - COMEX futures)": "SI=F",
+}
+
+# Shorthand tickers accepted in the watchlist box, in addition to plain NSE symbols
+WATCHLIST_ALIASES = {
+    "GOLD": "GC=F",
+    "SILVER": "SI=F",
+}
+
+PERIOD_OPTIONS = {
+    "3 Months": "3mo",
+    "6 Months": "6mo",
+    "1 Year": "1y",
+    "2 Years": "2y",
+}
+
+INTERVAL_OPTIONS = {
+    "Daily": "1d",
+    "Weekly": "1wk",
+}
+
+
+# ----------------------------------------------------------------------------
+# DATA FETCH
+# ----------------------------------------------------------------------------
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_price_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+    if df.empty:
+        return df
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna()
+    return df
+
+
+# ----------------------------------------------------------------------------
+# TECHNICAL INDICATORS
+# ----------------------------------------------------------------------------
+
+def compute_indicators(df: pd.DataFrame) -> dict:
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+    vol = df["Volume"] if "Volume" in df.columns else pd.Series(dtype=float)
+
+    sma20 = close.rolling(20).mean()
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi14 = 100 - (100 / (1 + rs))
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+
+    mid = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    bb_upper = mid + 2 * std
+    bb_lower = mid - 2 * std
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr14 = tr.rolling(14).mean()
+
+    lookback = min(60, len(df))
+    recent = df.tail(lookback)
+    swing_high = recent["High"].max()
+    swing_low = recent["Low"].min()
+
+    last_close = float(close.iloc[-1])
+    vol_avg20 = float(vol.rolling(20).mean().iloc[-1]) if not vol.empty else None
+    vol_last = float(vol.iloc[-1]) if not vol.empty else None
+
+    return {
+        "last_close": round(last_close, 2),
+        "sma20": round(float(sma20.iloc[-1]), 2) if not np.isnan(sma20.iloc[-1]) else None,
+        "sma50": round(float(sma50.iloc[-1]), 2) if not np.isnan(sma50.iloc[-1]) else None,
+        "sma200": round(float(sma200.iloc[-1]), 2) if len(df) >= 200 and not np.isnan(sma200.iloc[-1]) else None,
+        "rsi14": round(float(rsi14.iloc[-1]), 1) if not np.isnan(rsi14.iloc[-1]) else None,
+        "macd": round(float(macd.iloc[-1]), 3) if not np.isnan(macd.iloc[-1]) else None,
+        "macd_signal": round(float(signal.iloc[-1]), 3) if not np.isnan(signal.iloc[-1]) else None,
+        "bb_upper": round(float(bb_upper.iloc[-1]), 2) if not np.isnan(bb_upper.iloc[-1]) else None,
+        "bb_lower": round(float(bb_lower.iloc[-1]), 2) if not np.isnan(bb_lower.iloc[-1]) else None,
+        "atr14": round(float(atr14.iloc[-1]), 2) if not np.isnan(atr14.iloc[-1]) else None,
+        "swing_high_60d": round(float(swing_high), 2),
+        "swing_low_60d": round(float(swing_low), 2),
+        "vol_last": vol_last,
+        "vol_avg20": vol_avg20,
+    }, {"sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower}
+
+
+# ----------------------------------------------------------------------------
+# CHART
+# ----------------------------------------------------------------------------
+
+def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        name="Price", increasing_line_color="#0B6623", decreasing_line_color="#B22222",
+    ))
+    fig.add_trace(go.Scatter(x=df.index, y=overlays["sma20"], name="SMA 20",
+                              line=dict(color="#1f77b4", width=1)))
+    fig.add_trace(go.Scatter(x=df.index, y=overlays["sma50"], name="SMA 50",
+                              line=dict(color="#ff7f0e", width=1)))
+    fig.add_trace(go.Scatter(x=df.index, y=overlays["bb_upper"], name="BB Upper",
+                              line=dict(color="rgba(150,150,150,0.5)", width=1, dash="dot")))
+    fig.add_trace(go.Scatter(x=df.index, y=overlays["bb_lower"], name="BB Lower",
+                              line=dict(color="rgba(150,150,150,0.5)", width=1, dash="dot"),
+                              fill="tonexty", fillcolor="rgba(150,150,150,0.07)"))
+    fig.update_layout(
+        title=title, xaxis_rangeslider_visible=False, height=520,
+        margin=dict(l=10, r=10, t=40, b=10), template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+# ----------------------------------------------------------------------------
+# CLAUDE CALL
+# ----------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """You are a technical analysis assistant embedded in a personal investing \
+dashboard for an experienced Indian retail investor. You read price/indicator data and \
+describe the chart pattern and technical setup in plain, precise language.
+
+Rules:
+- Base your read strictly on the numeric data given. Do not invent price history you weren't given.
+- Identify classical chart/technical patterns only if the data genuinely supports them \
+(e.g. uptrend/downtrend, consolidation, breakout above resistance, oversold/overbought, \
+moving average crossover, Bollinger squeeze). Do not force a pattern name if none fits -- \
+say the structure is unclear or range-bound instead.
+- Your recommendation field is a technical-stance classification, not investment advice. \
+Always include a risk_note.
+- Return ONLY valid JSON, no markdown fences, no preamble, matching exactly this schema:
+
+{
+  "pattern_identified": "string, e.g. 'Ascending triangle near resistance' or 'No clear pattern - range-bound'",
+  "trend": "Uptrend | Downtrend | Sideways/Range-bound",
+  "key_support": number or null,
+  "key_resistance": number or null,
+  "recommendation": "Bullish | Bearish | Neutral | Watch",
+  "confidence": "High | Medium | Low",
+  "rationale": "2-4 sentences explaining the read, referencing the specific indicator values given",
+  "risk_note": "1-2 sentences on what would invalidate this read or key risk"
+}
+"""
+
+
+def call_claude_for_insight(symbol: str, asset_label: str, indicators: dict, interval: str) -> dict:
+    if anthropic is None:
+        raise RuntimeError("The 'anthropic' package is not installed. Add it to requirements.txt.")
+
+    api_key = st.secrets.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY"))
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not found in st.secrets or environment.")
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    user_prompt = f"""Asset: {asset_label} ({symbol})
+Timeframe: {interval} candles
+
+Latest technical snapshot:
+{json.dumps(indicators, indent=2)}
+
+Give your read as JSON per the schema."""
+
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = client.messages.create(
+                model=MODEL_NAME,
+                max_tokens=600,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            text = "".join(block.text for block in resp.content if block.type == "text").strip()
+            text = text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text)
+        except anthropic.RateLimitError as e:
+            last_error = e
+            wait = (2 ** attempt) * RATE_LIMIT_DELAY_SECONDS
+            time.sleep(wait)
+        except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
+            last_error = e
+            time.sleep(RATE_LIMIT_DELAY_SECONDS)
+
+    raise RuntimeError(f"AI call failed after {MAX_RETRIES} attempts: {last_error}")
+
+
+@st.cache_data(ttl=AI_CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_ai_insight(symbol: str, asset_label: str, indicators_json: str, interval: str, model_name: str) -> dict:
+    """Cache wrapper keyed on the actual indicator values (as a JSON string, so it's
+    hashable). Identical indicator snapshots within AI_CACHE_TTL_SECONDS reuse the
+    previous Claude response instead of paying for a fresh API call. A genuinely new
+    price snapshot (different indicators) produces a different cache key automatically."""
+    indicators = json.loads(indicators_json)
+    return call_claude_for_insight(symbol, asset_label, indicators, interval)
+
+
+def get_ai_insight(symbol: str, asset_label: str, indicators: dict, interval: str, force_refresh: bool = False) -> dict:
+    indicators_json = json.dumps(indicators, sort_keys=True)
+    if force_refresh:
+        _cached_ai_insight.clear()
+    return _cached_ai_insight(symbol, asset_label, indicators_json, interval, MODEL_NAME)
+
+
+# ----------------------------------------------------------------------------
+# UI HELPERS
+# ----------------------------------------------------------------------------
+
+REC_COLORS = {
+    "Bullish": "#0B6623",
+    "Bearish": "#B22222",
+    "Neutral": "#8a8a3c",
+    "Watch": "#B8860B",
+}
+
+
+def render_recommendation_card(insight: dict):
+    rec = insight.get("recommendation", "Watch")
+    color = REC_COLORS.get(rec, "#555555")
+    st.markdown(
+        f"""
+        <div style="border-left: 6px solid {color}; padding: 12px 16px;
+                    background: rgba(0,0,0,0.03); border-radius: 6px; margin-bottom: 10px;">
+            <span style="font-size: 1.1em; font-weight: 700; color: {color};">
+                {rec}
+            </span>
+            <span style="margin-left: 10px; color: #666;">
+                Confidence: {insight.get('confidence', 'n/a')}
+            </span>
+            <div style="margin-top: 8px; font-weight: 600;">
+                {insight.get('pattern_identified', '')}
+            </div>
+            <div style="margin-top: 4px; color: #333;">
+                Trend: {insight.get('trend', 'n/a')} &nbsp;|&nbsp;
+                Support: {insight.get('key_support', 'n/a')} &nbsp;|&nbsp;
+                Resistance: {insight.get('key_resistance', 'n/a')}
+            </div>
+            <div style="margin-top: 8px;">{insight.get('rationale', '')}</div>
+            <div style="margin-top: 8px; font-style: italic; color: #777; font-size: 0.9em;">
+                Risk: {insight.get('risk_note', '')}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ----------------------------------------------------------------------------
+# MAIN TAB RENDER FUNCTION -- call this from your app.py
+# ----------------------------------------------------------------------------
+
+def render_single_asset():
+    col1, col2, col3 = st.columns([2, 1, 1])
+
+    with col1:
+        asset_type = st.selectbox("Asset type", list(ASSET_PRESETS.keys()))
+        if ASSET_PRESETS[asset_type] is None:
+            symbol_input = st.text_input(
+                "NSE symbol (e.g. RELIANCE, TCS, GRSE)", value="GRSE"
+            ).strip().upper()
+            ticker = f"{symbol_input}.NS" if symbol_input else ""
+            asset_label = symbol_input
+        else:
+            ticker = ASSET_PRESETS[asset_type]
+            asset_label = asset_type
+            st.text_input("Ticker (auto)", value=ticker, disabled=True)
+
+    with col2:
+        period_label = st.selectbox("Period", list(PERIOD_OPTIONS.keys()), index=1)
+    with col3:
+        interval_label = st.selectbox("Interval", list(INTERVAL_OPTIONS.keys()))
+
+    fetch_clicked = st.button("Fetch Chart", type="primary")
+
+    state_key = "ai_chart_df"
+    if fetch_clicked and ticker:
+        with st.spinner(f"Fetching {ticker}..."):
+            df = fetch_price_data(ticker, PERIOD_OPTIONS[period_label], INTERVAL_OPTIONS[interval_label])
+        if df.empty:
+            st.error("No data returned. Check the symbol and try again.")
+            st.session_state.pop(state_key, None)
+        else:
+            st.session_state[state_key] = {
+                "df": df, "ticker": ticker, "asset_label": asset_label,
+                "interval_label": interval_label,
+            }
+
+    if state_key in st.session_state:
+        data = st.session_state[state_key]
+        df, ticker, asset_label, interval_label = (
+            data["df"], data["ticker"], data["asset_label"], data["interval_label"]
+        )
+
+        indicators, overlays = compute_indicators(df)
+        fig = build_candlestick_chart(df, overlays, f"{asset_label} ({ticker})")
+        st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("Latest technical snapshot (sent to AI)"):
+            st.json(indicators)
+
+        btn_col, refresh_col = st.columns([2, 1])
+        with btn_col:
+            get_insight_clicked = st.button("Get AI Insight", type="primary")
+        with refresh_col:
+            force_refresh = st.checkbox(
+                "Force refresh", help="Bypass the 1-hour cache and call the AI again even if this exact snapshot was analyzed recently."
+            )
+
+        if get_insight_clicked:
+            if anthropic is None:
+                st.error("Install the `anthropic` package and add it to requirements.txt.")
+            else:
+                with st.spinner("Analyzing chart with Claude..."):
+                    try:
+                        insight = get_ai_insight(ticker, asset_label, indicators, interval_label, force_refresh)
+                        st.session_state["ai_chart_insight"] = insight
+                    except Exception as e:
+                        st.error(f"AI insight failed: {e}")
+
+        if "ai_chart_insight" in st.session_state:
+            render_recommendation_card(st.session_state["ai_chart_insight"])
+            st.caption(
+                f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')} · Model: {MODEL_NAME} · "
+                f"Cached for {AI_CACHE_TTL_SECONDS // 60} min per unique snapshot · "
+                "For informational purposes only, not investment advice."
+            )
+    else:
+        st.info("Select an asset and click 'Fetch Chart' to begin.")
+
+
+# ----------------------------------------------------------------------------
+# WATCHLIST SCAN -- run AI insight across many symbols at once
+# ----------------------------------------------------------------------------
+
+def _resolve_watchlist_ticker(raw: str) -> tuple:
+    """Returns (yfinance_ticker, display_label) for a user-entered watchlist token."""
+    token = raw.strip().upper()
+    if not token:
+        return None, None
+    if token in WATCHLIST_ALIASES:
+        return WATCHLIST_ALIASES[token], token.title()
+    return f"{token}.NS", token
+
+
+def _guess_symbol_column(columns) -> str:
+    keywords = ["symbol", "ticker", "scrip", "stock", "nse", "name"]
+    lower_cols = {c: str(c).strip().lower() for c in columns}
+    for kw in keywords:
+        for col, low in lower_cols.items():
+            if kw in low:
+                return col
+    return list(columns)[0]
+
+
+def render_watchlist():
+    st.caption(
+        "Scan several symbols in one pass. Enter NSE stock symbols, and/or `GOLD` / `SILVER` "
+        "for the metals, separated by commas. Each symbol's AI insight is cached for "
+        f"{AI_CACHE_TTL_SECONDS // 60} minutes, so re-running the scan on unchanged charts costs no extra API calls."
+    )
+
+    with st.expander("📂 Load symbols from your portfolio Excel", expanded=False):
+        uploaded = st.file_uploader(
+            "Upload your portfolio workbook (.xlsx)", type=["xlsx", "xls", "csv"], key="wl_portfolio_upload"
+        )
+        if uploaded is not None:
+            try:
+                if uploaded.name.lower().endswith(".csv"):
+                    port_df = pd.read_csv(uploaded)
+                    sheet_used = None
+                else:
+                    xls = pd.ExcelFile(uploaded)
+                    sheet_names = xls.sheet_names
+                    sheet_used = st.selectbox("Sheet", sheet_names, key="wl_portfolio_sheet")
+                    port_df = pd.read_excel(xls, sheet_name=sheet_used)
+
+                if port_df.empty:
+                    st.warning("That sheet looks empty.")
+                else:
+                    default_col = _guess_symbol_column(port_df.columns)
+                    symbol_col = st.selectbox(
+                        "Which column has the stock symbol/name?",
+                        list(port_df.columns),
+                        index=list(port_df.columns).index(default_col),
+                        key="wl_portfolio_symbol_col",
+                    )
+                    st.dataframe(port_df[[symbol_col]].head(10), use_container_width=True, hide_index=True)
+
+                    include_metals = st.checkbox("Also include GOLD, SILVER", value=True, key="wl_portfolio_include_metals")
+
+                    if st.button("Load symbols into watchlist", key="wl_portfolio_load_btn"):
+                        raw_symbols = (
+                            port_df[symbol_col]
+                            .dropna()
+                            .astype(str)
+                            .str.strip()
+                            .str.upper()
+                            .str.replace(r"\.NS$", "", regex=True)  # in case symbols already have .NS
+                        )
+                        symbols = [s for s in dict.fromkeys(raw_symbols) if s]  # de-dupe, preserve order
+                        if include_metals:
+                            for m in ("GOLD", "SILVER"):
+                                if m not in symbols:
+                                    symbols.append(m)
+                        st.session_state["wl_symbols_text"] = ", ".join(symbols)
+                        st.success(f"Loaded {len(symbols)} symbols from '{uploaded.name}'"
+                                   + (f" (sheet: {sheet_used})" if sheet_used else "")
+                                   + " below.")
+            except Exception as e:
+                st.error(f"Couldn't read that file: {e}")
+
+    symbols_raw = st.text_area(
+        "Watchlist symbols (comma-separated)",
+        value=st.session_state.get("wl_symbols_text", "RELIANCE, TCS, INFY, GRSE, GOLD, SILVER"),
+        height=70,
+        key="wl_symbols_text",
+    )
+    wl_col1, wl_col2, wl_col3 = st.columns([1, 1, 1])
+    with wl_col1:
+        period_label = st.selectbox("Period", list(PERIOD_OPTIONS.keys()), index=1, key="wl_period")
+    with wl_col2:
+        interval_label = st.selectbox("Interval", list(INTERVAL_OPTIONS.keys()), key="wl_interval")
+    with wl_col3:
+        force_refresh = st.checkbox("Force refresh all", key="wl_force_refresh")
+
+    run_clicked = st.button("Run Watchlist Scan", type="primary")
+
+    if run_clicked:
+        tokens = [s for s in symbols_raw.split(",") if s.strip()]
+        if not tokens:
+            st.warning("Enter at least one symbol.")
+        else:
+            results = []
+            progress = st.progress(0.0, text="Starting scan...")
+            for i, raw in enumerate(tokens):
+                ticker, label = _resolve_watchlist_ticker(raw)
+                progress.progress((i) / len(tokens), text=f"Scanning {label}...")
+                row = {"Symbol": label, "Ticker": ticker}
+                try:
+                    df = fetch_price_data(ticker, PERIOD_OPTIONS[period_label], INTERVAL_OPTIONS[interval_label])
+                    if df.empty:
+                        row.update({"Error": "No data returned"})
+                        results.append(row)
+                        continue
+                    indicators, _ = compute_indicators(df)
+                    insight = get_ai_insight(ticker, label, indicators, interval_label, force_refresh)
+                    row.update({
+                        "Last Close": indicators.get("last_close"),
+                        "Trend": insight.get("trend"),
+                        "Recommendation": insight.get("recommendation"),
+                        "Confidence": insight.get("confidence"),
+                        "Pattern": insight.get("pattern_identified"),
+                        "Support": insight.get("key_support"),
+                        "Resistance": insight.get("key_resistance"),
+                        "Rationale": insight.get("rationale"),
+                        "Risk": insight.get("risk_note"),
+                    })
+                except Exception as e:
+                    row.update({"Error": str(e)})
+                results.append(row)
+
+                # Pace requests so a long watchlist doesn't burst past API rate limits.
+                is_last = (i == len(tokens) - 1)
+                if not is_last:
+                    if (i + 1) % RATE_LIMIT_BATCH_SIZE == 0:
+                        progress.progress((i + 1) / len(tokens), text=f"Pausing briefly ({RATE_LIMIT_BATCH_PAUSE_SECONDS}s) to respect API rate limits...")
+                        time.sleep(RATE_LIMIT_BATCH_PAUSE_SECONDS)
+                    else:
+                        time.sleep(RATE_LIMIT_DELAY_SECONDS)
+            progress.progress(1.0, text="Scan complete.")
+            st.session_state["watchlist_results"] = results
+
+    if "watchlist_results" in st.session_state:
+        results = st.session_state["watchlist_results"]
+        summary_rows = [
+            {
+                "Symbol": r["Symbol"],
+                "Last Close": r.get("Last Close", "-"),
+                "Trend": r.get("Trend", r.get("Error", "-")),
+                "Recommendation": r.get("Recommendation", "-"),
+                "Confidence": r.get("Confidence", "-"),
+                "Support": r.get("Support", "-"),
+                "Resistance": r.get("Resistance", "-"),
+            }
+            for r in results
+        ]
+        summary_df = pd.DataFrame(summary_rows)
+
+        def _color_rec(val):
+            color = REC_COLORS.get(val)
+            return f"color: {color}; font-weight: 700;" if color else ""
+
+        st.dataframe(
+            summary_df.style.applymap(_color_rec, subset=["Recommendation"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        for r in results:
+            if "Error" in r:
+                st.warning(f"{r['Symbol']}: {r['Error']}")
+                continue
+            with st.expander(f"{r['Symbol']} — {r['Recommendation']} ({r['Confidence']} confidence)"):
+                st.write(f"**Pattern:** {r['Pattern']}")
+                st.write(f"**Trend:** {r['Trend']} | **Support:** {r['Support']} | **Resistance:** {r['Resistance']}")
+                st.write(r["Rationale"])
+                st.caption(f"Risk: {r['Risk']}")
+
+        st.caption(
+            f"Scan run: {datetime.now().strftime('%d %b %Y, %H:%M')} · Model: {MODEL_NAME} · "
+            "For informational purposes only, not investment advice."
+        )
+    else:
+        st.info("Enter symbols above and click 'Run Watchlist Scan'.")
+
+
+# ----------------------------------------------------------------------------
+# TOP-LEVEL TAB ENTRY POINT -- call this from your app.py
+# ----------------------------------------------------------------------------
+
+def render_tab():
+    st.subheader("🤖 AI Chart Insights")
+    st.caption(
+        "AI-generated technical reads for stocks, gold and silver charts. "
+        "This is informational chart analysis, not investment advice -- always do your own "
+        "due diligence and consider consulting a SEBI-registered advisor before acting."
+    )
+
+    sub_tab1, sub_tab2 = st.tabs(["Single Asset", "Watchlist Scan"])
+    with sub_tab1:
+        render_single_asset()
+    with sub_tab2:
+        render_watchlist()
