@@ -1,64 +1,69 @@
-
 import json
 import os
-import time
-from datetime import datetime
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 import google.generativeai as genai
 
-# --- CONFIG ---
+# --- CONFIG & STYLE ---
 MODEL_NAME = "gemini-1.5-flash"
-AI_CACHE_TTL_SECONDS = 3600
-RATE_LIMIT_DELAY_SECONDS = 1.5
-RATE_LIMIT_BATCH_SIZE = 10
-RATE_LIMIT_BATCH_PAUSE_SECONDS = 6
-MAX_RETRIES = 3
 
-ASSET_PRESETS = {
-    "Indian Stock": None,
-    "Gold (Intl Spot proxy - COMEX futures)": "GC=F",
-    "Silver (Intl Spot proxy - COMEX futures)": "SI=F",
-}
+# CSS for a modern, elegant look
+st.markdown("""
+<style>
+    .stApp { background-color: #f8f9fa; }
+    .stButton>button { border-radius: 20px; font-weight: bold; background-color: #4a90e2; color: white; }
+    .insight-card { 
+        padding: 20px; border-radius: 15px; border-left: 8px solid #4a90e2; 
+        background-color: white; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# --- DATA FETCH & INDICATORS ---
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_price_data(ticker, period, interval):
-    df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
-    if df.empty: return df
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    return df.dropna()
-
-def compute_indicators(df):
-    close = df["Close"]
-    sma20 = close.rolling(20).mean()
-    sma50 = close.rolling(50).mean()
-    # (Simplified for example)
-    return {
-        "last_close": round(float(close.iloc[-1]), 2),
-        "sma20": round(float(sma20.iloc[-1]), 2),
-        "sma50": round(float(sma50.iloc[-1]), 2),
-    }, {"sma20": sma20, "sma50": sma50}
-
-# --- GEMINI CALL ---
-def get_insight(mode, symbol, asset_label, indicators, interval, force_refresh=False):
-    if mode == "rule":
-        return {"recommendation": "Neutral", "pattern_identified": "Rule-based analysis active"} # Simplified placeholder
-    
+# --- GEMINI INTEGRATION ---
+def call_gemini(indicators):
     api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    if not api_key: return {"error": "API Key missing"}
     
-    prompt = f"Analyze this chart: {json.dumps(indicators)}"
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(MODEL_NAME)
+    
+    prompt = f"Analyze this market data: {json.dumps(indicators)}. Return JSON with fields: pattern_identified, trend, recommendation (Bullish/Bearish/Neutral), confidence, rationale, risk_note."
+    
     response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
     return json.loads(response.text)
 
-# --- RENDER TAB (This was missing!) ---
+# --- CORE LOGIC ---
+@st.cache_data(ttl=900)
+def fetch_data(ticker):
+    df = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=True)
+    return df.dropna() if not df.empty else df
+
+def compute_indicators(df):
+    close = df["Close"]
+    sma20 = close.rolling(20).mean().iloc[-1]
+    sma50 = close.rolling(50).mean().iloc[-1]
+    return {"last_close": float(close.iloc[-1]), "sma20": float(sma20), "sma50": float(sma50)}
+
+# --- UI ---
 def render_tab():
-    st.subheader("🤖 AI Chart Insights")
-    st.write("Welcome to the AI Chart analyzer.")
-    # Add your UI logic here (inputs, buttons, etc.)
-    # Ensure this calls the functions defined above.
+    st.title("📈 AI Market Insight Pro")
+    st.markdown("---")
+    
+    ticker = st.text_input("Enter NSE Ticker (e.g., RELIANCE.NS)", "RELIANCE.NS")
+    btn = st.button("🚀 Analyze Now")
+
+    if btn:
+        with st.spinner("Gemini is analyzing..."):
+            df = fetch_data(ticker)
+            if not df.empty:
+                ind = compute_indicators(df)
+                res = call_gemini(ind)
+                
+                st.markdown(f'<div class="insight-card">', unsafe_allow_html=True)
+                st.subheader(f"Analysis for {ticker}")
+                st.metric("Recommendation", res.get("recommendation", "N/A"))
+                st.write(f"**Pattern:** {res.get('pattern_identified')}")
+                st.write(f"**Rationale:** {res.get('rationale')}")
+                st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.error("Invalid Ticker or No Data.")
