@@ -4,4 +4,5 @@ plotly>=5.20
 pandas>=2.0
 numpy>=1.24
 anthropic>=0.34
+google-generativeai>=0.8.0
 openpyxl>=3.1
