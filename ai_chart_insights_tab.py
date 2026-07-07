@@ -94,6 +94,11 @@ INTERVAL_OPTIONS = {
     "Weekly": "1wk",
 }
 
+ANALYSIS_MODES = {
+    "Free (Rule-based, no API needed)": "rule",
+    "AI Narrative (Claude API - uses credits)": "ai",
+}
+
 
 # ----------------------------------------------------------------------------
 # DATA FETCH
@@ -172,6 +177,108 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "vol_last": vol_last,
         "vol_avg20": vol_avg20,
     }, {"sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower}
+
+
+# ----------------------------------------------------------------------------
+# FREE RULE-BASED ANALYSIS -- no API key, no cost, works forever
+# ----------------------------------------------------------------------------
+
+def rule_based_insight(indicators: dict) -> dict:
+    """Produces the exact same schema as the AI insight, but derived entirely
+    from coded technical rules -- zero API calls, zero cost."""
+    last_close = indicators.get("last_close")
+    sma20 = indicators.get("sma20")
+    sma50 = indicators.get("sma50")
+    rsi = indicators.get("rsi14")
+    macd = indicators.get("macd")
+    macd_signal = indicators.get("macd_signal")
+    bb_upper = indicators.get("bb_upper")
+    bb_lower = indicators.get("bb_lower")
+    swing_high = indicators.get("swing_high_60d")
+    swing_low = indicators.get("swing_low_60d")
+    atr = indicators.get("atr14")
+
+    signals = []  # (description, direction) where direction: +1 bullish, -1 bearish, 0 neutral
+
+    if sma20 is not None and sma50 is not None and last_close is not None:
+        if last_close > sma20 > sma50:
+            trend = "Uptrend"
+            signals.append(("Price above rising SMA20, which is above SMA50", 1))
+        elif last_close < sma20 < sma50:
+            trend = "Downtrend"
+            signals.append(("Price below falling SMA20, which is below SMA50", -1))
+        else:
+            trend = "Sideways/Range-bound"
+            signals.append(("Moving averages mixed or overlapping", 0))
+    else:
+        trend = "Sideways/Range-bound"
+        signals.append(("Not enough history yet for a full moving-average read", 0))
+
+    if rsi is not None:
+        if rsi >= 70:
+            signals.append((f"RSI at {rsi} is in overbought territory", -1))
+        elif rsi <= 30:
+            signals.append((f"RSI at {rsi} is in oversold territory", 1))
+        else:
+            signals.append((f"RSI at {rsi} is in neutral territory", 0))
+
+    if macd is not None and macd_signal is not None:
+        if macd > macd_signal:
+            signals.append(("MACD is above its signal line (bullish crossover)", 1))
+        else:
+            signals.append(("MACD is below its signal line (bearish crossover)", -1))
+
+    if bb_upper is not None and bb_lower is not None and last_close is not None and bb_upper > bb_lower:
+        band_pos = (last_close - bb_lower) / (bb_upper - bb_lower)
+        if band_pos >= 0.95:
+            signals.append(("Price is testing the upper Bollinger Band", -1))
+        elif band_pos <= 0.05:
+            signals.append(("Price is testing the lower Bollinger Band", 1))
+
+    directions = [d for _, d in signals if d != 0]
+    score = sum(directions)
+
+    if score >= 2:
+        recommendation = "Bullish"
+    elif score <= -2:
+        recommendation = "Bearish"
+    elif score == 0 and directions:
+        recommendation = "Neutral"
+    else:
+        recommendation = "Watch"
+
+    if directions:
+        pos_count = sum(1 for d in directions if d > 0)
+        neg_count = sum(1 for d in directions if d < 0)
+        total = len(directions)
+        if pos_count == total or neg_count == total:
+            confidence = "High"
+        elif abs(pos_count - neg_count) >= 1:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+    else:
+        confidence = "Low"
+
+    pattern_bits = [desc for desc, _ in signals]
+    pattern_identified = "; ".join(pattern_bits) if pattern_bits else "No clear pattern - insufficient data"
+    rationale = "Rule-based technical read: " + "; ".join(pattern_bits) + "."
+
+    risk_note = "Automated rule-based technical read (no AI narrative) -- not investment advice."
+    if atr is not None and last_close:
+        vol_pct = (atr / last_close) * 100
+        risk_note += f" Recent volatility (ATR) is about {vol_pct:.1f}% of price; size positions accordingly."
+
+    return {
+        "pattern_identified": pattern_identified,
+        "trend": trend,
+        "key_support": swing_low,
+        "key_resistance": swing_high,
+        "recommendation": recommendation,
+        "confidence": confidence,
+        "rationale": rationale,
+        "risk_note": risk_note,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -290,6 +397,13 @@ def get_ai_insight(symbol: str, asset_label: str, indicators: dict, interval: st
     return _cached_ai_insight(symbol, asset_label, indicators_json, interval, MODEL_NAME)
 
 
+def get_insight(mode: str, symbol: str, asset_label: str, indicators: dict, interval: str, force_refresh: bool = False) -> dict:
+    """Single entry point used by the UI. mode is 'rule' or 'ai' (see ANALYSIS_MODES)."""
+    if mode == "rule":
+        return rule_based_insight(indicators)
+    return get_ai_insight(symbol, asset_label, indicators, interval, force_refresh)
+
+
 # ----------------------------------------------------------------------------
 # UI HELPERS
 # ----------------------------------------------------------------------------
@@ -383,35 +497,52 @@ def render_single_asset():
         fig = build_candlestick_chart(df, overlays, f"{asset_label} ({ticker})")
         st.plotly_chart(fig, use_container_width=True)
 
-        with st.expander("Latest technical snapshot (sent to AI)"):
+        with st.expander("Latest technical snapshot"):
             st.json(indicators)
+
+        mode_label = st.radio(
+            "Analysis mode", list(ANALYSIS_MODES.keys()), horizontal=True, key="single_mode"
+        )
+        mode = ANALYSIS_MODES[mode_label]
 
         btn_col, refresh_col = st.columns([2, 1])
         with btn_col:
-            get_insight_clicked = st.button("Get AI Insight", type="primary")
+            btn_label = "Get Insight" if mode == "rule" else "Get AI Insight"
+            get_insight_clicked = st.button(btn_label, type="primary")
         with refresh_col:
             force_refresh = st.checkbox(
-                "Force refresh", help="Bypass the 1-hour cache and call the AI again even if this exact snapshot was analyzed recently."
+                "Force refresh",
+                help="Bypass the 1-hour cache and call the AI again even if this exact snapshot was analyzed recently.",
+                disabled=(mode == "rule"),
             )
 
         if get_insight_clicked:
-            if anthropic is None:
-                st.error("Install the `anthropic` package and add it to requirements.txt.")
+            if mode == "ai" and anthropic is None:
+                st.error("Install the `anthropic` package and add it to requirements.txt, or switch to Free (Rule-based) mode.")
             else:
-                with st.spinner("Analyzing chart with Claude..."):
+                spinner_msg = "Running rule-based analysis..." if mode == "rule" else "Analyzing chart with Claude..."
+                with st.spinner(spinner_msg):
                     try:
-                        insight = get_ai_insight(ticker, asset_label, indicators, interval_label, force_refresh)
+                        insight = get_insight(mode, ticker, asset_label, indicators, interval_label, force_refresh)
                         st.session_state["ai_chart_insight"] = insight
+                        st.session_state["ai_chart_insight_mode"] = mode
                     except Exception as e:
-                        st.error(f"AI insight failed: {e}")
+                        st.error(f"Insight generation failed: {e}")
 
         if "ai_chart_insight" in st.session_state:
             render_recommendation_card(st.session_state["ai_chart_insight"])
-            st.caption(
-                f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')} · Model: {MODEL_NAME} · "
-                f"Cached for {AI_CACHE_TTL_SECONDS // 60} min per unique snapshot · "
-                "For informational purposes only, not investment advice."
-            )
+            used_mode = st.session_state.get("ai_chart_insight_mode", mode)
+            if used_mode == "rule":
+                st.caption(
+                    f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')} · Free rule-based engine, no API used · "
+                    "For informational purposes only, not investment advice."
+                )
+            else:
+                st.caption(
+                    f"Generated {datetime.now().strftime('%d %b %Y, %H:%M')} · Model: {MODEL_NAME} · "
+                    f"Cached for {AI_CACHE_TTL_SECONDS // 60} min per unique snapshot · "
+                    "For informational purposes only, not investment advice."
+                )
     else:
         st.info("Select an asset and click 'Fetch Chart' to begin.")
 
@@ -511,6 +642,13 @@ def render_watchlist():
     with wl_col3:
         force_refresh = st.checkbox("Force refresh all", key="wl_force_refresh")
 
+    mode_label = st.radio(
+        "Analysis mode", list(ANALYSIS_MODES.keys()), horizontal=True, key="wl_mode"
+    )
+    mode = ANALYSIS_MODES[mode_label]
+    if mode == "rule":
+        st.caption("Free mode: no API calls, no rate limiting needed -- scans run at full speed.")
+
     run_clicked = st.button("Run Watchlist Scan", type="primary")
 
     if run_clicked:
@@ -531,7 +669,7 @@ def render_watchlist():
                         results.append(row)
                         continue
                     indicators, _ = compute_indicators(df)
-                    insight = get_ai_insight(ticker, label, indicators, interval_label, force_refresh)
+                    insight = get_insight(mode, ticker, label, indicators, interval_label, force_refresh)
                     row.update({
                         "Last Close": indicators.get("last_close"),
                         "Trend": insight.get("trend"),
@@ -548,8 +686,9 @@ def render_watchlist():
                 results.append(row)
 
                 # Pace requests so a long watchlist doesn't burst past API rate limits.
+                # No API calls in free/rule mode, so no need to pace at all.
                 is_last = (i == len(tokens) - 1)
-                if not is_last:
+                if mode == "ai" and not is_last:
                     if (i + 1) % RATE_LIMIT_BATCH_SIZE == 0:
                         progress.progress((i + 1) / len(tokens), text=f"Pausing briefly ({RATE_LIMIT_BATCH_PAUSE_SECONDS}s) to respect API rate limits...")
                         time.sleep(RATE_LIMIT_BATCH_PAUSE_SECONDS)
@@ -557,6 +696,7 @@ def render_watchlist():
                         time.sleep(RATE_LIMIT_DELAY_SECONDS)
             progress.progress(1.0, text="Scan complete.")
             st.session_state["watchlist_results"] = results
+            st.session_state["watchlist_mode"] = mode
 
     if "watchlist_results" in st.session_state:
         results = st.session_state["watchlist_results"]
@@ -594,10 +734,17 @@ def render_watchlist():
                 st.write(r["Rationale"])
                 st.caption(f"Risk: {r['Risk']}")
 
-        st.caption(
-            f"Scan run: {datetime.now().strftime('%d %b %Y, %H:%M')} · Model: {MODEL_NAME} · "
-            "For informational purposes only, not investment advice."
-        )
+        used_mode = st.session_state.get("watchlist_mode", mode)
+        if used_mode == "rule":
+            st.caption(
+                f"Scan run: {datetime.now().strftime('%d %b %Y, %H:%M')} · Free rule-based engine, no API used · "
+                "For informational purposes only, not investment advice."
+            )
+        else:
+            st.caption(
+                f"Scan run: {datetime.now().strftime('%d %b %Y, %H:%M')} · Model: {MODEL_NAME} · "
+                "For informational purposes only, not investment advice."
+            )
     else:
         st.info("Enter symbols above and click 'Run Watchlist Scan'.")
 
