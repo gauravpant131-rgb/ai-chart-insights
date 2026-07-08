@@ -917,6 +917,29 @@ investment advice. Always include a risk_note.
 """
 
 
+def diagnose_gemini_key() -> str:
+    """Lightweight, low-token connectivity check -- confirms in one click whether
+    the key/config problem is 'not installed', 'not found', or 'rejected by
+    Google', instead of guessing from a key's prefix (which Google has changed
+    more than once and which this app never validates anyway)."""
+    if genai is None:
+        return "\u274C The `google-genai` package isn't installed (check requirements.txt)."
+    api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
+    if not api_key:
+        return (
+            "\u274C No GEMINI_API_KEY found. On Streamlit Community Cloud, a local "
+            "secrets.toml is NOT picked up automatically -- set it under your app's "
+            "**Settings \u2192 Secrets** in the Streamlit Cloud dashboard instead."
+        )
+    try:
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(model=MODEL_NAME, contents="Reply with exactly: OK")
+        text = (resp.text or "").strip()
+        return f"\u2705 Key works -- {MODEL_NAME} replied: \"{text[:60]}\""
+    except Exception as e:
+        return f"\u274C Google rejected the request: {e}"
+
+
 def call_gemini_for_insight(symbol: str, asset_label: str, indicators: dict, interval: str) -> dict:
     if genai is None:
         raise RuntimeError("The 'google-genai' package is not installed. Add it to requirements.txt.")
@@ -1404,6 +1427,20 @@ def render_watchlist():
 
 def render_tab():
     inject_custom_css()
+
+    with st.sidebar:
+        st.markdown("### \U0001F511 Gemini API status")
+        if st.button("Test Gemini connection"):
+            with st.spinner("Pinging Gemini..."):
+                result = diagnose_gemini_key()
+            (st.success if result.startswith("\u2705") else st.error)(result)
+        st.caption(
+            "Note: a key not starting with `AIza` isn't necessarily broken -- Google "
+            "introduced a newer 'Auth key' format in 2026. This app doesn't check the "
+            "key's shape at all, it just asks Google directly, so use the button above "
+            "for a real answer instead of the prefix."
+        )
+
     st.markdown(
         """
         <div class="aci-hero">
