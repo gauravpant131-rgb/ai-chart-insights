@@ -940,6 +940,14 @@ def diagnose_gemini_key() -> str:
         return f"\u274C Google rejected the request: {e}"
 
 
+def _is_daily_quota_exhausted(err: Exception) -> bool:
+    """A 429 has two very different causes: a per-minute rate limit (worth
+    retrying after a short backoff) and a per-day quota (retrying is pointless
+    until the reset). Google's error body distinguishes them via the quotaId."""
+    msg = str(err)
+    return "RESOURCE_EXHAUSTED" in msg and ("PerDay" in msg or "generate_content_free_tier_requests" in msg)
+
+
 def call_gemini_for_insight(symbol: str, asset_label: str, indicators: dict, interval: str) -> dict:
     if genai is None:
         raise RuntimeError("The 'google-genai' package is not installed. Add it to requirements.txt.")
@@ -975,8 +983,21 @@ Give your read as JSON per the schema."""
             return json.loads(text)
         except Exception as e:
             last_error = e
+            if _is_daily_quota_exhausted(e):
+                # A per-day cap won't clear in seconds -- retrying just burns
+                # the retry budget for no benefit. Fail immediately instead.
+                break
             time.sleep((2 ** attempt) * RATE_LIMIT_DELAY_SECONDS)
 
+    if last_error is not None and _is_daily_quota_exhausted(last_error):
+        raise RuntimeError(
+            f"Daily free-tier quota for {MODEL_NAME} is used up on this Google Cloud project "
+            "(the exact number is whatever AI Studio's quota panel shows you -- it varies by "
+            "project/account, so don't rely on any fixed figure). It resets at midnight Pacific "
+            "Time. Until then: use Free (Rule-based) mode below (no API calls at all), or try "
+            "switching MODEL_NAME to 'gemini-2.5-flash-lite' in the code, which draws from a "
+            "separate quota bucket."
+        )
     raise RuntimeError(f"AI call failed after {MAX_RETRIES} attempts: {last_error}")
 
 
@@ -1193,7 +1214,13 @@ def render_single_asset():
                         st.session_state["ai_chart_insight"] = insight
                         st.session_state["ai_chart_insight_mode"] = mode
                     except Exception as e:
-                        st.error(f"Insight generation failed: {e}")
+                        if mode == "ai" and "quota" in str(e).lower():
+                            st.warning(f"{e}\n\nShowing the free rule-based read below instead for now.")
+                            insight = get_insight("rule", ticker, asset_label, indicators, interval_label, False)
+                            st.session_state["ai_chart_insight"] = insight
+                            st.session_state["ai_chart_insight_mode"] = "rule"
+                        else:
+                            st.error(f"Insight generation failed: {e}")
 
         if "ai_chart_insight" in st.session_state:
             render_recommendation_card(st.session_state["ai_chart_insight"])
