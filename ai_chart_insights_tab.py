@@ -412,7 +412,7 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     }, {
         "sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower,
         "supertrend_up": supertrend_up, "supertrend_down": supertrend_down,
-        "rsi14": rsi14, "macd_hist": macd_hist,
+        "rsi14": rsi14, "macd": macd, "macd_signal": signal, "macd_hist": macd_hist,
         "rsi_divergence": rsi_div, "macd_divergence": macd_div,
         "vwap": vwap_series,
     }
@@ -728,7 +728,7 @@ def rule_based_insight(indicators: dict) -> dict:
 
 def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str, fib_levels: dict = None) -> go.Figure:
     fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True, row_heights=[0.58, 0.20, 0.22],
+        rows=4, cols=1, shared_xaxes=True, row_heights=[0.46, 0.16, 0.16, 0.22],
         vertical_spacing=0.03,
     )
     fig.add_trace(go.Candlestick(
@@ -785,20 +785,44 @@ def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str, fib_le
                                           line=dict(color=color, width=2, dash="dash"),
                                           marker=dict(size=7, color=color), showlegend=False), row=2, col=1)
 
+    # --- MACD panel: line, signal, and histogram -- the classic three-piece view ---
+    if "macd" in overlays and "macd_signal" in overlays:
+        hist = overlays.get("macd_hist")
+        if hist is not None:
+            hist_colors = np.where(hist.fillna(0) >= 0, "#0F9D58", "#D93025")
+            fig.add_trace(go.Bar(x=df.index, y=hist, name="MACD Histogram",
+                                  marker_color=hist_colors, opacity=0.55), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=overlays["macd"], name="MACD",
+                                  line=dict(color="#2c5364", width=1.4)), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=overlays["macd_signal"], name="MACD Signal",
+                                  line=dict(color="#F4A100", width=1.4)), row=3, col=1)
+        fig.add_hline(y=0, line=dict(color="rgba(120,120,140,0.4)", width=1), row=3, col=1)
+
+        macd_div = overlays.get("macd_divergence") or {}
+        for key, color, label in (("bear_points", "#D93025", "Bearish Divergence"),
+                                   ("bull_points", "#0F9D58", "Bullish Divergence")):
+            pts = macd_div.get(key)
+            if pts:
+                (t1, p1, m1), (t2, p2, m2) = pts
+                fig.add_trace(go.Scatter(x=[t1, t2], y=[m1, m2], mode="lines+markers", name=f"{label} (MACD)",
+                                          line=dict(color=color, width=2, dash="dash"),
+                                          marker=dict(size=7, color=color), showlegend=False), row=3, col=1)
+
     if "Volume" in df.columns:
         vol_colors = np.where(df["Close"] >= df["Open"], "#0F9D58", "#D93025")
         fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume",
-                              marker_color=vol_colors, opacity=0.6), row=3, col=1)
+                              marker_color=vol_colors, opacity=0.6), row=4, col=1)
 
     fig.update_layout(
-        title=title, xaxis_rangeslider_visible=False, height=760,
+        title=title, xaxis_rangeslider_visible=False, height=920,
         margin=dict(l=10, r=10, t=40, b=10), template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         plot_bgcolor="rgba(250,251,253,1)",
     )
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
-    fig.update_yaxes(title_text="Volume", row=3, col=1)
+    fig.update_yaxes(title_text="MACD", row=3, col=1)
+    fig.update_yaxes(title_text="Volume", row=4, col=1)
     return fig
 
 
