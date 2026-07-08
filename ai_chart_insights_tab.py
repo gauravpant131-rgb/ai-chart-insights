@@ -337,6 +337,16 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     vol_last = float(vol.iloc[-1]) if not vol.empty else None
     vol_ratio = round(vol_last / vol_avg20, 2) if (vol_last and vol_avg20) else None
 
+    # --- Supertrend (10, 3) -- the standard desk default ---
+    supertrend_series, supertrend_dir = compute_supertrend(df, period=10, multiplier=3.0)
+    supertrend_direction = "Bullish" if int(supertrend_dir.iloc[-1]) == 1 else "Bearish"
+    supertrend_up = supertrend_series.where(supertrend_dir == 1)
+    supertrend_down = supertrend_series.where(supertrend_dir == -1)
+
+    # --- RSI & MACD-histogram divergence over the last 60 candles ---
+    rsi_div = detect_divergence(df, rsi14, "RSI", order=3, lookback=60)
+    macd_div = detect_divergence(df, macd_hist, "MACD histogram", order=3, lookback=60)
+
     def _safe(series):
         try:
             v = series.iloc[-1]
@@ -366,7 +376,140 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "swing_low_60d": round(swing_low, 2),
         "vol_last": vol_last,
         "vol_avg20": vol_avg20,
-    }, {"sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower}
+        "supertrend": _safe(supertrend_series),
+        "supertrend_direction": supertrend_direction,
+        "rsi_divergence": rsi_div["type"],
+        "rsi_divergence_detail": rsi_div["detail"],
+        "macd_divergence": macd_div["type"],
+        "macd_divergence_detail": macd_div["detail"],
+    }, {
+        "sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower,
+        "supertrend_up": supertrend_up, "supertrend_down": supertrend_down,
+        "rsi14": rsi14, "macd_hist": macd_hist,
+        "rsi_divergence": rsi_div, "macd_divergence": macd_div,
+    }
+
+
+# ----------------------------------------------------------------------------
+# PRO-TRADER ADD-ONS: SUPERTREND + RSI/MACD DIVERGENCE
+# ----------------------------------------------------------------------------
+# These plug straight into the existing indicator engine: compute_indicators()
+# calls both helpers below and folds their output into the same `indicators`
+# dict and `overlays` dict that already flow through to the chart, the rule
+# engine, the indicator grid, and the AI prompt (which just json.dumps the
+# indicators dict) -- so nothing downstream had to change shape.
+
+def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
+    """Classic ATR-based Supertrend. Returns (supertrend_series, direction_series)
+    where direction is +1 (uptrend / price above the line) or -1 (downtrend)."""
+    high, low, close = df["High"], df["Low"], df["Close"]
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()  # Wilder-style smoothing
+
+    hl2 = (high + low) / 2
+    basic_upper = hl2 + multiplier * atr
+    basic_lower = hl2 - multiplier * atr
+
+    n = len(df)
+    final_upper = basic_upper.copy()
+    final_lower = basic_lower.copy()
+    supertrend = pd.Series(index=df.index, dtype=float)
+    direction = pd.Series(index=df.index, dtype=int)
+
+    for i in range(n):
+        if i == 0:
+            final_upper.iloc[i] = basic_upper.iloc[i]
+            final_lower.iloc[i] = basic_lower.iloc[i]
+            direction.iloc[i] = 1
+            supertrend.iloc[i] = final_lower.iloc[i]
+            continue
+
+        final_upper.iloc[i] = (
+            basic_upper.iloc[i]
+            if (basic_upper.iloc[i] < final_upper.iloc[i - 1] or close.iloc[i - 1] > final_upper.iloc[i - 1])
+            else final_upper.iloc[i - 1]
+        )
+        final_lower.iloc[i] = (
+            basic_lower.iloc[i]
+            if (basic_lower.iloc[i] > final_lower.iloc[i - 1] or close.iloc[i - 1] < final_lower.iloc[i - 1])
+            else final_lower.iloc[i - 1]
+        )
+
+        if direction.iloc[i - 1] == 1:
+            direction.iloc[i] = -1 if close.iloc[i] < final_lower.iloc[i] else 1
+        else:
+            direction.iloc[i] = 1 if close.iloc[i] > final_upper.iloc[i] else -1
+
+        supertrend.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
+
+    return supertrend, direction
+
+
+def _find_swing_points(vals: np.ndarray, order: int = 3):
+    """Lightweight local-extrema finder (no scipy dependency). Returns positional
+    indices of swing highs and swing lows within `vals`."""
+    n = len(vals)
+    highs_idx, lows_idx = [], []
+    for i in range(order, n - order):
+        window = vals[i - order:i + order + 1]
+        if np.isnan(window).any():
+            continue
+        center = vals[i]
+        if center == window.max() and (window == center).sum() == 1:
+            highs_idx.append(i)
+        if center == window.min() and (window == center).sum() == 1:
+            lows_idx.append(i)
+    return highs_idx, lows_idx
+
+
+def detect_divergence(df: pd.DataFrame, indicator_series: pd.Series, label: str,
+                       order: int = 3, lookback: int = 60) -> dict:
+    """Compares the last two price swing highs/lows against the same indicator
+    (RSI or MACD histogram) at those same points -- the standard definition of
+    regular bullish/bearish divergence. Returns plot-ready timestamp/value pairs
+    so the chart can draw the trendlines, not just report them as text."""
+    lb = min(lookback, len(df))
+    price = df["Close"].tail(lb)
+    ind = indicator_series.reindex(df.index).tail(lb)
+    idx = price.index
+    p_vals = price.values
+    i_vals = ind.values
+
+    result = {"type": None, "detail": None, "bear_points": None, "bull_points": None}
+    if lb < (2 * order + 5):
+        return result
+
+    highs_idx, lows_idx = _find_swing_points(p_vals, order=order)
+
+    if len(highs_idx) >= 2:
+        a, b = highs_idx[-2], highs_idx[-1]
+        if p_vals[b] > p_vals[a] and pd.notna(i_vals[a]) and pd.notna(i_vals[b]) and i_vals[b] < i_vals[a]:
+            result["type"] = "Bearish"
+            result["detail"] = (
+                f"Price made a higher high ({p_vals[a]:.2f} -> {p_vals[b]:.2f}) while {label} made a "
+                f"lower high ({i_vals[a]:.2f} -> {i_vals[b]:.2f}) -- classic bearish divergence."
+            )
+            result["bear_points"] = [(idx[a], p_vals[a], i_vals[a]), (idx[b], p_vals[b], i_vals[b])]
+
+    if len(lows_idx) >= 2:
+        a, b = lows_idx[-2], lows_idx[-1]
+        if p_vals[b] < p_vals[a] and pd.notna(i_vals[a]) and pd.notna(i_vals[b]) and i_vals[b] > i_vals[a]:
+            bull_detail = (
+                f"Price made a lower low ({p_vals[a]:.2f} -> {p_vals[b]:.2f}) while {label} made a "
+                f"higher low ({i_vals[a]:.2f} -> {i_vals[b]:.2f}) -- classic bullish divergence."
+            )
+            if result["type"] is None:
+                result["type"] = "Bullish"
+                result["detail"] = bull_detail
+            else:
+                result["detail"] = result["detail"] + " " + bull_detail
+            result["bull_points"] = [(idx[a], p_vals[a], i_vals[a]), (idx[b], p_vals[b], i_vals[b])]
+
+    return result
 
 
 # ----------------------------------------------------------------------------
@@ -473,6 +616,25 @@ def rule_based_insight(indicators: dict) -> dict:
         elif macd is not None and macd_signal is not None:
             signals.append((f"Volume is {vol_ratio}x the 20-day average, confirming downside move", -1))
 
+    supertrend_direction = indicators.get("supertrend_direction")
+    if supertrend_direction == "Bullish":
+        signals.append((f"Supertrend (10,3) is bullish -- price holding above {indicators.get('supertrend')}", 1))
+    elif supertrend_direction == "Bearish":
+        signals.append((f"Supertrend (10,3) is bearish -- price under {indicators.get('supertrend')}", -1))
+
+    # Divergence is a higher-conviction reversal signal, so it's weighted 2x a normal signal.
+    rsi_divergence = indicators.get("rsi_divergence")
+    if rsi_divergence == "Bullish":
+        signals.append((f"Bullish RSI divergence: {indicators.get('rsi_divergence_detail')}", 2))
+    elif rsi_divergence == "Bearish":
+        signals.append((f"Bearish RSI divergence: {indicators.get('rsi_divergence_detail')}", -2))
+
+    macd_divergence = indicators.get("macd_divergence")
+    if macd_divergence == "Bullish":
+        signals.append((f"Bullish MACD-histogram divergence: {indicators.get('macd_divergence_detail')}", 2))
+    elif macd_divergence == "Bearish":
+        signals.append((f"Bearish MACD-histogram divergence: {indicators.get('macd_divergence_detail')}", -2))
+
     directions = [d for _, d in signals if d != 0]
     score = sum(directions)
 
@@ -524,7 +686,7 @@ def rule_based_insight(indicators: dict) -> dict:
 
 def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str, fib_levels: dict = None) -> go.Figure:
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25],
+        rows=3, cols=1, shared_xaxes=True, row_heights=[0.58, 0.20, 0.22],
         vertical_spacing=0.03,
     )
     fig.add_trace(go.Candlestick(
@@ -541,6 +703,15 @@ def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str, fib_le
                               line=dict(color="rgba(120,120,140,0.55)", width=1, dash="dot"),
                               fill="tonexty", fillcolor="rgba(44,83,100,0.06)"), row=1, col=1)
 
+    # --- Supertrend overlay -- split into up/down segments so the line color
+    # flips green/red exactly where the trend flips, like a desk terminal. ---
+    if "supertrend_up" in overlays:
+        fig.add_trace(go.Scatter(x=df.index, y=overlays["supertrend_up"], name="Supertrend (Bullish)",
+                                  line=dict(color="#0F9D58", width=2), connectgaps=False), row=1, col=1)
+    if "supertrend_down" in overlays:
+        fig.add_trace(go.Scatter(x=df.index, y=overlays["supertrend_down"], name="Supertrend (Bearish)",
+                                  line=dict(color="#D93025", width=2), connectgaps=False), row=1, col=1)
+
     if fib_levels:
         fib_colors = ["#9AA5B1", "#7C8CA6", "#5E7CE2", "#F4A100", "#D93025", "#9AA5B1"]
         for (label, level), color in zip(fib_levels.items(), fib_colors):
@@ -548,19 +719,40 @@ def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str, fib_le
                           annotation_text=f"Fib {label}", annotation_position="right",
                           annotation_font_size=9, row=1, col=1)
 
+    # --- RSI panel with overbought/oversold guides + divergence trendlines ---
+    if "rsi14" in overlays:
+        fig.add_trace(go.Scatter(x=df.index, y=overlays["rsi14"], name="RSI (14)",
+                                  line=dict(color="#5E7CE2", width=1.4)), row=2, col=1)
+        fig.add_hline(y=70, line=dict(color="rgba(217,48,37,0.5)", width=1, dash="dot"), row=2, col=1)
+        fig.add_hline(y=30, line=dict(color="rgba(15,157,88,0.5)", width=1, dash="dot"), row=2, col=1)
+
+        rsi_div = overlays.get("rsi_divergence") or {}
+        for key, color, label in (("bear_points", "#D93025", "Bearish Divergence"),
+                                   ("bull_points", "#0F9D58", "Bullish Divergence")):
+            pts = rsi_div.get(key)
+            if pts:
+                (t1, p1, r1), (t2, p2, r2) = pts
+                fig.add_trace(go.Scatter(x=[t1, t2], y=[p1, p2], mode="lines+markers", name=f"{label} (Price)",
+                                          line=dict(color=color, width=2, dash="dash"),
+                                          marker=dict(size=7, color=color)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=[t1, t2], y=[r1, r2], mode="lines+markers", name=f"{label} (RSI)",
+                                          line=dict(color=color, width=2, dash="dash"),
+                                          marker=dict(size=7, color=color), showlegend=False), row=2, col=1)
+
     if "Volume" in df.columns:
         vol_colors = np.where(df["Close"] >= df["Open"], "#0F9D58", "#D93025")
         fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="Volume",
-                              marker_color=vol_colors, opacity=0.6), row=2, col=1)
+                              marker_color=vol_colors, opacity=0.6), row=3, col=1)
 
     fig.update_layout(
-        title=title, xaxis_rangeslider_visible=False, height=600,
+        title=title, xaxis_rangeslider_visible=False, height=760,
         margin=dict(l=10, r=10, t=40, b=10), template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         plot_bgcolor="rgba(250,251,253,1)",
     )
     fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
+    fig.update_yaxes(title_text="Volume", row=3, col=1)
     return fig
 
 
@@ -632,6 +824,10 @@ Rules:
 (e.g. uptrend/downtrend, consolidation, breakout above resistance, oversold/overbought, \
 moving average crossover, Bollinger squeeze, Fibonacci confluence). Do not force a pattern \
 name if none fits -- say the structure is unclear or range-bound instead.
+- The data includes a Supertrend(10,3) direction and any detected RSI/MACD-histogram \
+divergence. Treat a live divergence (bullish or bearish) as a higher-conviction reversal \
+signal that can override a purely trend-following read, and call this out explicitly in \
+the rationale when present. Treat the Supertrend direction as a trend-confirmation filter.
 - Your recommendation field is a technical-stance classification (BUY / SELL / HOLD), not \
 investment advice. Always include a risk_note.
 - Return ONLY valid JSON, no markdown fences, no preamble, matching exactly this schema:
@@ -769,12 +965,22 @@ def render_indicator_grid(ind: dict):
         ("Volume vs 20d Avg", fmt(ind.get("vol_ratio_vs_avg20"), "x")),
         ("60D Support", fmt(ind.get("swing_low_60d"))),
         ("60D Resistance", fmt(ind.get("swing_high_60d"))),
+        ("Supertrend (10,3)", fmt(ind.get("supertrend"))),
+        ("Supertrend Direction", "\U0001F7E2 Bullish" if ind.get("supertrend_direction") == "Bullish"
+         else ("\U0001F534 Bearish" if ind.get("supertrend_direction") == "Bearish" else "\u2014")),
+        ("RSI Divergence", f"\u26A0\uFE0F {ind['rsi_divergence']}" if ind.get("rsi_divergence") else "None"),
+        ("MACD Divergence", f"\u26A0\uFE0F {ind['macd_divergence']}" if ind.get("macd_divergence") else "None"),
     ]
     html = '<div class="aci-metric-grid">'
     for label, val in items:
         html += f'<div class="aci-metric"><div class="lbl">{label}</div><div class="val">{val}</div></div>'
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
+
+    if ind.get("rsi_divergence_detail"):
+        st.caption(f"\U0001F4C9 RSI: {ind['rsi_divergence_detail']}")
+    if ind.get("macd_divergence_detail"):
+        st.caption(f"\U0001F4C9 MACD: {ind['macd_divergence_detail']}")
 
     fib = ind.get("fib_levels")
     if fib:
