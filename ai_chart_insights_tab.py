@@ -343,9 +343,30 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     supertrend_up = supertrend_series.where(supertrend_dir == 1)
     supertrend_down = supertrend_series.where(supertrend_dir == -1)
 
+    # --- Anchored VWAP -- anchored at the most recent Supertrend flip, so it
+    # reflects the volume-weighted average price of the *current* trend leg
+    # rather than an arbitrary fixed window. Falls back to the start of the
+    # fetched period if no flip occurred (e.g. short lookback). ---
+    flip_positions = np.flatnonzero(supertrend_dir.diff().fillna(0).to_numpy() != 0)
+    vwap_anchor_pos = int(flip_positions[-1]) if len(flip_positions) else 0
+    vwap_series = compute_anchored_vwap(df, vwap_anchor_pos)
+    vwap_anchor_date = str(df.index[vwap_anchor_pos].date())
+
     # --- RSI & MACD-histogram divergence over the last 60 candles ---
     rsi_div = detect_divergence(df, rsi14, "RSI", order=3, lookback=60)
     macd_div = detect_divergence(df, macd_hist, "MACD histogram", order=3, lookback=60)
+
+    # --- ATR-based stop/target brackets -- reuses the atr14 already computed
+    # above (no new series). 1.5x ATR stop / 2.5x ATR target is a standard
+    # desk default giving roughly a 1:1.7 reward-to-risk skeleton. ---
+    atr_last = float(atr14.iloc[-1]) if pd.notna(atr14.iloc[-1]) else None
+    if atr_last:
+        stop_long = round(last_close - 1.5 * atr_last, 2)
+        target_long = round(last_close + 2.5 * atr_last, 2)
+        stop_short = round(last_close + 1.5 * atr_last, 2)
+        target_short = round(last_close - 2.5 * atr_last, 2)
+    else:
+        stop_long = target_long = stop_short = target_short = None
 
     def _safe(series):
         try:
@@ -382,11 +403,18 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "rsi_divergence_detail": rsi_div["detail"],
         "macd_divergence": macd_div["type"],
         "macd_divergence_detail": macd_div["detail"],
+        "vwap_anchored": _safe(vwap_series),
+        "vwap_anchor_date": vwap_anchor_date,
+        "stop_long": stop_long,
+        "target_long": target_long,
+        "stop_short": stop_short,
+        "target_short": target_short,
     }, {
         "sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower,
         "supertrend_up": supertrend_up, "supertrend_down": supertrend_down,
         "rsi14": rsi14, "macd_hist": macd_hist,
         "rsi_divergence": rsi_div, "macd_divergence": macd_div,
+        "vwap": vwap_series,
     }
 
 
@@ -447,6 +475,20 @@ def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3
         supertrend.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
 
     return supertrend, direction
+
+
+def compute_anchored_vwap(df: pd.DataFrame, anchor_pos: int) -> pd.Series:
+    """Volume-weighted average price computed cumulatively from `anchor_pos`
+    to the end of the dataframe. Values before the anchor are NaN (undefined)."""
+    vwap = pd.Series(index=df.index, dtype=float)
+    if "Volume" not in df.columns or df["Volume"].fillna(0).sum() == 0:
+        return vwap
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    tp_vol = typical * df["Volume"]
+    cum_tp_vol = tp_vol.iloc[anchor_pos:].cumsum()
+    cum_vol = df["Volume"].iloc[anchor_pos:].cumsum().replace(0, np.nan)
+    vwap.iloc[anchor_pos:] = cum_tp_vol / cum_vol
+    return vwap
 
 
 def _find_swing_points(vals: np.ndarray, order: int = 3):
@@ -712,6 +754,10 @@ def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str, fib_le
         fig.add_trace(go.Scatter(x=df.index, y=overlays["supertrend_down"], name="Supertrend (Bearish)",
                                   line=dict(color="#D93025", width=2), connectgaps=False), row=1, col=1)
 
+    if "vwap" in overlays:
+        fig.add_trace(go.Scatter(x=df.index, y=overlays["vwap"], name="Anchored VWAP",
+                                  line=dict(color="#8E44AD", width=1.6, dash="dash")), row=1, col=1)
+
     if fib_levels:
         fib_colors = ["#9AA5B1", "#7C8CA6", "#5E7CE2", "#F4A100", "#D93025", "#9AA5B1"]
         for (label, level), color in zip(fib_levels.items(), fib_colors):
@@ -827,7 +873,9 @@ name if none fits -- say the structure is unclear or range-bound instead.
 - The data includes a Supertrend(10,3) direction and any detected RSI/MACD-histogram \
 divergence. Treat a live divergence (bullish or bearish) as a higher-conviction reversal \
 signal that can override a purely trend-following read, and call this out explicitly in \
-the rationale when present. Treat the Supertrend direction as a trend-confirmation filter.
+the rationale when present. Treat the Supertrend direction as a trend-confirmation filter. \
+The data also includes an anchored VWAP (anchored at the most recent Supertrend flip) -- price \
+holding above it within an uptrend, or below it within a downtrend, adds confluence to your read.
 - Your recommendation field is a technical-stance classification (BUY / SELL / HOLD), not \
 investment advice. Always include a risk_note.
 - Return ONLY valid JSON, no markdown fences, no preamble, matching exactly this schema:
@@ -904,9 +952,25 @@ def get_ai_insight(symbol: str, asset_label: str, indicators: dict, interval: st
 
 def get_insight(mode: str, symbol: str, asset_label: str, indicators: dict, interval: str, force_refresh: bool = False) -> dict:
     """Single entry point used by the UI. mode is 'rule' or 'ai' (see ANALYSIS_MODES)."""
-    if mode == "rule":
-        return rule_based_insight(indicators)
-    return get_ai_insight(symbol, asset_label, indicators, interval, force_refresh)
+    insight = rule_based_insight(indicators) if mode == "rule" else get_ai_insight(symbol, asset_label, indicators, interval, force_refresh)
+    return _attach_risk_bracket(insight, indicators)
+
+
+def _attach_risk_bracket(insight: dict, indicators: dict) -> dict:
+    """Adds an ATR-based stop/target bracket to whichever insight came back
+    (AI or rule-based), keyed off that insight's own BUY/SELL/HOLD call so
+    both analysis modes get the same risk-sizing treatment for free."""
+    rec = str(insight.get("recommendation", "HOLD")).upper()
+    if rec == "BUY":
+        insight["suggested_stop"] = indicators.get("stop_long")
+        insight["suggested_target"] = indicators.get("target_long")
+    elif rec == "SELL":
+        insight["suggested_stop"] = indicators.get("stop_short")
+        insight["suggested_target"] = indicators.get("target_short")
+    else:
+        insight["suggested_stop"] = None
+        insight["suggested_target"] = None
+    return insight
 
 
 # ----------------------------------------------------------------------------
@@ -936,6 +1000,11 @@ def render_recommendation_card(insight: dict):
                 Support: <b>{insight.get('key_support', 'n/a')}</b> &nbsp;|&nbsp;
                 Resistance: <b>{insight.get('key_resistance', 'n/a')}</b>
             </div>
+            {f'''<div style="margin-top: 6px; color: #374151;">
+                Suggested Stop: <b style="color:#D93025;">{insight.get('suggested_stop')}</b> &nbsp;|&nbsp;
+                Suggested Target: <b style="color:#0F9D58;">{insight.get('suggested_target')}</b>
+                <span style="color:#9AA5B1;">(1.5x / 2.5x ATR14 bracket)</span>
+            </div>''' if insight.get('suggested_stop') is not None else ''}
             <div style="margin-top: 10px; color:#1f2937;">{insight.get('rationale', '')}</div>
             <div style="margin-top: 8px; font-style: italic; color: #6b7280; font-size: 0.9em;">
                 \u26A0\uFE0F Risk: {insight.get('risk_note', '')}
@@ -970,6 +1039,7 @@ def render_indicator_grid(ind: dict):
          else ("\U0001F534 Bearish" if ind.get("supertrend_direction") == "Bearish" else "\u2014")),
         ("RSI Divergence", f"\u26A0\uFE0F {ind['rsi_divergence']}" if ind.get("rsi_divergence") else "None"),
         ("MACD Divergence", f"\u26A0\uFE0F {ind['macd_divergence']}" if ind.get("macd_divergence") else "None"),
+        ("Anchored VWAP", f"{fmt(ind.get('vwap_anchored'))} (since {ind.get('vwap_anchor_date', 'n/a')})"),
     ]
     html = '<div class="aci-metric-grid">'
     for label, val in items:
