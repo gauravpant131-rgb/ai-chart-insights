@@ -89,6 +89,7 @@ WATCHLIST_ALIASES = {
 }
 
 PERIOD_OPTIONS = {
+    "1 Month": "1mo",
     "3 Months": "3mo",
     "6 Months": "6mo",
     "1 Year": "1y",
@@ -98,7 +99,13 @@ PERIOD_OPTIONS = {
 INTERVAL_OPTIONS = {
     "Daily": "1d",
     "Weekly": "1wk",
+    "Monthly": "1mo",
 }
+
+# Below this many candles, ATR14/SMA50/Supertrend/divergence get unreliable or
+# outright NaN -- used to warn the user rather than silently show a half-broken
+# chart when they pick a short period + coarse interval (e.g. 1M + Monthly).
+MIN_RELIABLE_CANDLES = 55
 
 ANALYSIS_MODES = {
     "Free (Rule-based, no API needed)": "rule",
@@ -1135,8 +1142,7 @@ def render_indicator_grid(ind: dict):
 # ----------------------------------------------------------------------------
 
 def render_single_asset():
-    col1, col2, col3 = st.columns([2, 1, 1])
-
+    col1, col2 = st.columns([2, 3])
     with col1:
         asset_type = st.selectbox("Asset type", list(ASSET_PRESETS.keys()))
         if ASSET_PRESETS[asset_type] is None:
@@ -1151,9 +1157,16 @@ def render_single_asset():
             st.text_input("Ticker (auto)", value=ticker, disabled=True)
 
     with col2:
-        period_label = st.selectbox("Period", list(PERIOD_OPTIONS.keys()), index=1)
-    with col3:
-        interval_label = st.selectbox("Interval", list(INTERVAL_OPTIONS.keys()))
+        st.caption("Period")
+        period_label = st.radio(
+            "Period", list(PERIOD_OPTIONS.keys()), index=2, horizontal=True,
+            label_visibility="collapsed", key="single_period",
+        )
+        st.caption("Interval")
+        interval_label = st.radio(
+            "Interval", list(INTERVAL_OPTIONS.keys()), horizontal=True,
+            label_visibility="collapsed", key="single_interval",
+        )
 
     fetch_clicked = st.button("\U0001F50D Fetch Chart", type="primary")
 
@@ -1165,6 +1178,13 @@ def render_single_asset():
             st.error("No data returned. Check the symbol and try again.")
             st.session_state.pop(state_key, None)
         else:
+            if len(df) < MIN_RELIABLE_CANDLES:
+                st.warning(
+                    f"Only {len(df)} candles at {period_label} / {interval_label} -- SMA50, ATR14, "
+                    f"Supertrend and divergence detection want {MIN_RELIABLE_CANDLES}+ to be reliable. "
+                    "Pick a longer period or a finer interval (e.g. Daily instead of Monthly) for a "
+                    "trustworthy read."
+                )
             st.session_state[state_key] = {
                 "df": df, "ticker": ticker, "asset_label": asset_label,
                 "interval_label": interval_label,
@@ -1329,7 +1349,7 @@ def render_watchlist():
     )
     wl_col1, wl_col2, wl_col3 = st.columns([1, 1, 1])
     with wl_col1:
-        period_label = st.selectbox("Period", list(PERIOD_OPTIONS.keys()), index=1, key="wl_period")
+        period_label = st.selectbox("Period", list(PERIOD_OPTIONS.keys()), index=2, key="wl_period")
     with wl_col2:
         interval_label = st.selectbox("Interval", list(INTERVAL_OPTIONS.keys()), key="wl_interval")
     with wl_col3:
