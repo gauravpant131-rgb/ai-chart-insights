@@ -1169,12 +1169,30 @@ Give your read as JSON per the schema."""
                 config=genai_types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     response_mime_type="application/json",
-                    max_output_tokens=700,
+                    max_output_tokens=1536,
+                    # This is a deterministic structured-JSON extraction task, not a
+                    # reasoning task -- Gemini 2.5's internal "thinking" tokens count
+                    # against the SAME max_output_tokens budget as the visible answer,
+                    # so leaving thinking on can silently eat the whole budget and cut
+                    # the JSON off mid-string (the "Unterminated string" error).
+                    thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
                 ),
             )
             text = (resp.text or "").strip()
             text = text.replace("```json", "").replace("```", "").strip()
-            return json.loads(text)
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as je:
+                finish_reason = None
+                try:
+                    finish_reason = resp.candidates[0].finish_reason
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"Gemini returned malformed/truncated JSON ({je}). "
+                    f"finish_reason={finish_reason}, response length={len(text)} chars. "
+                    f"Raw tail: ...{text[-120:]!r}"
+                ) from je
         except Exception as e:
             last_error = e
             if _is_daily_quota_exhausted(e):
