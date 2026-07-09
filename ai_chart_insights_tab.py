@@ -498,6 +498,46 @@ def compute_anchored_vwap(df: pd.DataFrame, anchor_pos: int) -> pd.Series:
     return vwap
 
 
+def nearest_support_resistance(indicators: dict) -> dict:
+    """Pools every price level the engine already computes -- 60D swing
+    high/low, Bollinger bands, Fibonacci retracements, and anchored VWAP --
+    and picks the nearest one below price (support) and above price
+    (resistance). This is a confluence read: a level that's ALSO a Fib
+    retracement or a Bollinger band, not just an arbitrary 60-day extreme,
+    is the kind of level that actually gets defended on a real desk.
+    No new data fetch -- pure re-use of fields already in `indicators`."""
+    last_close = indicators.get("last_close")
+    if last_close is None:
+        return {"support": None, "resistance": None, "support_label": None, "resistance_label": None}
+
+    candidates = []  # (level, label)
+    if indicators.get("swing_low_60d") is not None:
+        candidates.append((indicators["swing_low_60d"], "60D swing low"))
+    if indicators.get("swing_high_60d") is not None:
+        candidates.append((indicators["swing_high_60d"], "60D swing high"))
+    if indicators.get("bb_lower") is not None:
+        candidates.append((indicators["bb_lower"], "Lower Bollinger Band"))
+    if indicators.get("bb_upper") is not None:
+        candidates.append((indicators["bb_upper"], "Upper Bollinger Band"))
+    if indicators.get("vwap_anchored") is not None:
+        candidates.append((indicators["vwap_anchored"], "Anchored VWAP"))
+    for label, level in (indicators.get("fib_levels") or {}).items():
+        candidates.append((level, f"Fib {label} retracement"))
+
+    below = [(lvl, lbl) for lvl, lbl in candidates if lvl < last_close]
+    above = [(lvl, lbl) for lvl, lbl in candidates if lvl > last_close]
+
+    support = max(below, key=lambda x: x[0]) if below else None
+    resistance = min(above, key=lambda x: x[0]) if above else None
+
+    return {
+        "support": round(support[0], 2) if support else indicators.get("swing_low_60d"),
+        "support_label": support[1] if support else "60D swing low",
+        "resistance": round(resistance[0], 2) if resistance else indicators.get("swing_high_60d"),
+        "resistance_label": resistance[1] if resistance else "60D swing high",
+    }
+
+
 def _find_swing_points(vals: np.ndarray, order: int = 3):
     """Lightweight local-extrema finder (no scipy dependency). Returns positional
     indices of swing highs and swing lows within `vals`."""
@@ -711,16 +751,30 @@ def rule_based_insight(indicators: dict) -> dict:
     pattern_identified = "; ".join(pattern_bits) if pattern_bits else "No clear pattern - insufficient data"
     rationale = "Rule-based technical read across trend, momentum, volatility and volume: " + "; ".join(pattern_bits) + "."
 
+    levels = nearest_support_resistance(indicators)
+
     risk_note = "Automated rule-based technical read (no AI narrative) -- not investment advice."
     if atr is not None and last_close:
         vol_pct = (atr / last_close) * 100
         risk_note += f" Recent volatility (ATR) is about {vol_pct:.1f}% of price; size positions accordingly."
 
+    # Structural stop -- the Supertrend line IS the standard trailing-stop
+    # reference for whichever side it's currently on, so this needs no new
+    # computation, just surfacing what's already sitting in `indicators`.
+    structural_stop = indicators.get("supertrend")
+    if recommendation == "BUY" and structural_stop is not None:
+        risk_note += f" Structural stop: below the Supertrend line at {structural_stop} (also see the ATR-based bracket below)."
+    elif recommendation == "SELL" and structural_stop is not None:
+        risk_note += f" Structural stop: above the Supertrend line at {structural_stop} (also see the ATR-based bracket below)."
+
     return {
         "pattern_identified": pattern_identified,
         "trend": trend,
-        "key_support": swing_low,
-        "key_resistance": swing_high,
+        "key_support": levels["support"],
+        "key_support_label": levels["support_label"],
+        "key_resistance": levels["resistance"],
+        "key_resistance_label": levels["resistance_label"],
+        "structural_stop": structural_stop,
         "recommendation": recommendation,
         "confidence": confidence,
         "rationale": rationale,
@@ -1034,7 +1088,9 @@ def get_insight(mode: str, symbol: str, asset_label: str, indicators: dict, inte
 def _attach_risk_bracket(insight: dict, indicators: dict) -> dict:
     """Adds an ATR-based stop/target bracket to whichever insight came back
     (AI or rule-based), keyed off that insight's own BUY/SELL/HOLD call so
-    both analysis modes get the same risk-sizing treatment for free."""
+    both analysis modes get the same risk-sizing treatment for free. Also
+    backfills a Supertrend-based structural stop and confluence support/
+    resistance if the insight (e.g. the AI path) didn't already set them."""
     rec = str(insight.get("recommendation", "HOLD")).upper()
     if rec == "BUY":
         insight["suggested_stop"] = indicators.get("stop_long")
@@ -1045,6 +1101,20 @@ def _attach_risk_bracket(insight: dict, indicators: dict) -> dict:
     else:
         insight["suggested_stop"] = None
         insight["suggested_target"] = None
+
+    insight.setdefault("structural_stop", indicators.get("supertrend"))
+
+    levels = nearest_support_resistance(indicators)
+    insight.setdefault("key_support", levels["support"])
+    insight.setdefault("key_resistance", levels["resistance"])
+    if insight.get("key_support_label") is None:
+        insight["key_support_label"] = (
+            levels["support_label"] if insight.get("key_support") == levels["support"] else "AI-identified level"
+        )
+    if insight.get("key_resistance_label") is None:
+        insight["key_resistance_label"] = (
+            levels["resistance_label"] if insight.get("key_resistance") == levels["resistance"] else "AI-identified level"
+        )
     return insight
 
 
@@ -1072,14 +1142,20 @@ def render_recommendation_card(insight: dict):
             </div>
             <div style="margin-top: 6px; color: #374151;">
                 Trend: <b>{insight.get('trend', 'n/a')}</b> &nbsp;|&nbsp;
-                Support: <b>{insight.get('key_support', 'n/a')}</b> &nbsp;|&nbsp;
+                Support: <b>{insight.get('key_support', 'n/a')}</b>
+                <span style="color:#9AA5B1;">({insight.get('key_support_label', 'n/a')})</span> &nbsp;|&nbsp;
                 Resistance: <b>{insight.get('key_resistance', 'n/a')}</b>
+                <span style="color:#9AA5B1;">({insight.get('key_resistance_label', 'n/a')})</span>
             </div>
             {f'''<div style="margin-top: 6px; color: #374151;">
                 Suggested Stop: <b style="color:#D93025;">{insight.get('suggested_stop')}</b> &nbsp;|&nbsp;
                 Suggested Target: <b style="color:#0F9D58;">{insight.get('suggested_target')}</b>
                 <span style="color:#9AA5B1;">(1.5x / 2.5x ATR14 bracket)</span>
             </div>''' if insight.get('suggested_stop') is not None else ''}
+            {f'''<div style="margin-top: 4px; color: #374151;">
+                Structural Stop: <b style="color:#D93025;">{insight.get('structural_stop')}</b>
+                <span style="color:#9AA5B1;">(Supertrend line -- use if trailing a trend trade instead of a fixed ATR stop)</span>
+            </div>''' if insight.get('structural_stop') is not None else ''}
             <div style="margin-top: 10px; color:#1f2937;">{insight.get('rationale', '')}</div>
             <div style="margin-top: 8px; font-style: italic; color: #6b7280; font-size: 0.9em;">
                 \u26A0\uFE0F Risk: {insight.get('risk_note', '')}
