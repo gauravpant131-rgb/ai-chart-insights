@@ -359,6 +359,10 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     vwap_series = compute_anchored_vwap(df, vwap_anchor_pos)
     vwap_anchor_date = str(df.index[vwap_anchor_pos].date())
 
+    # --- Volume Profile (POC + Value Area) over the last 90 candles ---
+    vp = compute_volume_profile(df, bins=24, lookback=90)
+    vp_tip = volume_profile_tip(last_close, vp)
+
     # --- RSI & MACD-histogram divergence over the last 60 candles ---
     rsi_div = detect_divergence(df, rsi14, "RSI", order=3, lookback=60)
     macd_div = detect_divergence(df, macd_hist, "MACD histogram", order=3, lookback=60)
@@ -416,12 +420,16 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "target_long": target_long,
         "stop_short": stop_short,
         "target_short": target_short,
+        "vp_poc": vp["poc"] if vp else None,
+        "vp_va_low": vp["va_low"] if vp else None,
+        "vp_va_high": vp["va_high"] if vp else None,
+        "volume_profile_tip": vp_tip,
     }, {
         "sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower,
         "supertrend_up": supertrend_up, "supertrend_down": supertrend_down,
         "rsi14": rsi14, "macd": macd, "macd_signal": signal, "macd_hist": macd_hist,
         "rsi_divergence": rsi_div, "macd_divergence": macd_div,
-        "vwap": vwap_series,
+        "vwap": vwap_series, "volume_profile": vp,
     }
 
 
@@ -521,6 +529,12 @@ def nearest_support_resistance(indicators: dict) -> dict:
         candidates.append((indicators["bb_upper"], "Upper Bollinger Band"))
     if indicators.get("vwap_anchored") is not None:
         candidates.append((indicators["vwap_anchored"], "Anchored VWAP"))
+    if indicators.get("vp_poc") is not None:
+        candidates.append((indicators["vp_poc"], "Volume Profile POC"))
+    if indicators.get("vp_va_low") is not None:
+        candidates.append((indicators["vp_va_low"], "Value Area Low"))
+    if indicators.get("vp_va_high") is not None:
+        candidates.append((indicators["vp_va_high"], "Value Area High"))
     for label, level in (indicators.get("fib_levels") or {}).items():
         candidates.append((level, f"Fib {label} retracement"))
 
@@ -536,6 +550,87 @@ def nearest_support_resistance(indicators: dict) -> dict:
         "resistance": round(resistance[0], 2) if resistance else indicators.get("swing_high_60d"),
         "resistance_label": resistance[1] if resistance else "60D swing high",
     }
+
+
+def compute_volume_profile(df: pd.DataFrame, bins: int = 24, lookback: int = 90):
+    """Builds a volume-by-price histogram over the last `lookback` candles.
+    Daily OHLCV has no intrabar tick data, so each candle's volume is
+    distributed across every price bin its High-Low range overlaps,
+    proportional to the overlap width -- the standard approximation used
+    when real tick/footprint data isn't available. Returns bin edges/volumes
+    plus the Point of Control (highest-volume price) and a 70%-of-volume
+    Value Area, the two reference levels a desk actually watches."""
+    if "Volume" not in df.columns or df["Volume"].fillna(0).sum() == 0:
+        return None
+    sub = df.tail(min(lookback, len(df)))
+    price_min, price_max = float(sub["Low"].min()), float(sub["High"].max())
+    if price_max <= price_min:
+        return None
+
+    bin_edges = np.linspace(price_min, price_max, bins + 1)
+    bin_volumes = np.zeros(bins)
+    lows, highs, vols = sub["Low"].to_numpy(), sub["High"].to_numpy(), sub["Volume"].fillna(0).to_numpy()
+    for lo, hi, vol in zip(lows, highs, vols):
+        if hi <= lo or vol <= 0:
+            continue
+        overlap = np.clip(np.minimum(bin_edges[1:], hi) - np.maximum(bin_edges[:-1], lo), 0, None)
+        total = overlap.sum()
+        if total > 0:
+            bin_volumes += vol * (overlap / total)
+
+    total_vol = bin_volumes.sum()
+    if total_vol <= 0:
+        return None
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    poc_idx = int(np.argmax(bin_volumes))
+
+    # Expand outward from POC, always taking whichever neighboring bin has
+    # more volume, until 70% of total traded volume is enclosed -- the
+    # textbook Value Area definition.
+    lo_i = hi_i = poc_idx
+    cum = bin_volumes[poc_idx]
+    while cum < 0.70 * total_vol and (lo_i > 0 or hi_i < bins - 1):
+        next_lo = bin_volumes[lo_i - 1] if lo_i > 0 else -1
+        next_hi = bin_volumes[hi_i + 1] if hi_i < bins - 1 else -1
+        if next_hi >= next_lo:
+            hi_i += 1
+            cum += bin_volumes[hi_i]
+        else:
+            lo_i -= 1
+            cum += bin_volumes[lo_i]
+
+    return {
+        "bin_edges": bin_edges, "bin_centers": bin_centers, "bin_volumes": bin_volumes,
+        "poc_idx": poc_idx, "va_lo_idx": lo_i, "va_hi_idx": hi_i,
+        "poc": round(float(bin_centers[poc_idx]), 2),
+        "va_low": round(float(bin_centers[lo_i]), 2),
+        "va_high": round(float(bin_centers[hi_i]), 2),
+    }
+
+
+def volume_profile_tip(last_close, vp):
+    """Plain-English read of where price sits relative to the Value Area --
+    this is what the rule engine surfaces as its volume-profile 'tip'."""
+    if last_close is None or vp is None:
+        return None
+    poc, va_low, va_high = vp["poc"], vp["va_low"], vp["va_high"]
+    if last_close > va_high:
+        return (
+            f"Price ({last_close}) is trading ABOVE the Value Area (POC {poc}, VA {va_low}-{va_high}). "
+            f"Most recent volume traded lower, so this move is happening on comparatively thin acceptance -- "
+            f"watch {va_high} as the first support level to hold if price pulls back toward value."
+        )
+    if last_close < va_low:
+        return (
+            f"Price ({last_close}) is trading BELOW the Value Area (POC {poc}, VA {va_low}-{va_high}). "
+            f"Selling has pushed price under where most recent volume traded -- watch {va_low} as the first "
+            f"resistance level on any bounce back toward value."
+        )
+    return (
+        f"Price ({last_close}) is trading INSIDE the Value Area (POC {poc}, VA {va_low}-{va_high}) -- this "
+        f"is the recent 'fair value' zone where the heaviest buying and selling agreed on price. Expect "
+        f"range-bound chop between {va_low} and {va_high} unless price breaks out on strong volume."
+    )
 
 
 def _find_swing_points(vals: np.ndarray, order: int = 3):
@@ -775,6 +870,7 @@ def rule_based_insight(indicators: dict) -> dict:
         "key_resistance": levels["resistance"],
         "key_resistance_label": levels["resistance_label"],
         "structural_stop": structural_stop,
+        "volume_profile_tip": indicators.get("volume_profile_tip"),
         "recommendation": recommendation,
         "confidence": confidence,
         "rationale": rationale,
@@ -789,8 +885,15 @@ def rule_based_insight(indicators: dict) -> dict:
 
 def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str, fib_levels: dict = None) -> go.Figure:
     fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True, row_heights=[0.46, 0.16, 0.16, 0.22],
-        vertical_spacing=0.03,
+        rows=4, cols=2, shared_xaxes=True, shared_yaxes=True,
+        row_heights=[0.46, 0.16, 0.16, 0.22], column_widths=[0.82, 0.18],
+        vertical_spacing=0.03, horizontal_spacing=0.01,
+        specs=[
+            [{}, {}],
+            [{"colspan": 2}, None],
+            [{"colspan": 2}, None],
+            [{"colspan": 2}, None],
+        ],
     )
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
@@ -818,6 +921,28 @@ def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str, fib_le
     if "vwap" in overlays:
         fig.add_trace(go.Scatter(x=df.index, y=overlays["vwap"], name="Anchored VWAP",
                                   line=dict(color="#8E44AD", width=1.6, dash="dash")), row=1, col=1)
+
+    # --- Volume Profile pane -- horizontal histogram of volume-by-price next
+    # to the candles, sharing the same y-axis so levels line up visually.
+    # POC bin gold, Value Area bins blue, everything else dim gray. ---
+    vp = overlays.get("volume_profile")
+    if vp:
+        n_bins = len(vp["bin_volumes"])
+        bar_colors = []
+        for i in range(n_bins):
+            if i == vp["poc_idx"]:
+                bar_colors.append("#F4A100")
+            elif vp["va_lo_idx"] <= i <= vp["va_hi_idx"]:
+                bar_colors.append("rgba(94,124,226,0.65)")
+            else:
+                bar_colors.append("rgba(154,165,177,0.45)")
+        bar_width = (vp["bin_edges"][1] - vp["bin_edges"][0]) * 0.9
+        fig.add_trace(go.Bar(x=vp["bin_volumes"], y=vp["bin_centers"], orientation="h",
+                              marker_color=bar_colors, width=bar_width, name="Volume Profile",
+                              showlegend=False), row=1, col=2)
+        fig.add_hline(y=vp["poc"], line=dict(color="#F4A100", width=1, dash="dot"), row=1, col=1)
+        fig.add_hline(y=vp["va_high"], line=dict(color="rgba(94,124,226,0.5)", width=1, dash="dot"), row=1, col=1)
+        fig.add_hline(y=vp["va_low"], line=dict(color="rgba(94,124,226,0.5)", width=1, dash="dot"), row=1, col=1)
 
     if fib_levels:
         fib_colors = ["#9AA5B1", "#7C8CA6", "#5E7CE2", "#F4A100", "#D93025", "#9AA5B1"]
@@ -879,8 +1004,11 @@ def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str, fib_le
         margin=dict(l=10, r=10, t=40, b=10), template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         plot_bgcolor="rgba(250,251,253,1)",
+        bargap=0.02,
     )
     fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(showticklabels=False, row=1, col=2)
+    fig.update_xaxes(showticklabels=False, title_text="Vol.", row=1, col=2)
     fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
     fig.update_yaxes(title_text="MACD", row=3, col=1)
     fig.update_yaxes(title_text="Volume", row=4, col=1)
@@ -961,6 +1089,11 @@ signal that can override a purely trend-following read, and call this out explic
 the rationale when present. Treat the Supertrend direction as a trend-confirmation filter. \
 The data also includes an anchored VWAP (anchored at the most recent Supertrend flip) -- price \
 holding above it within an uptrend, or below it within a downtrend, adds confluence to your read.
+- The data also includes a Volume Profile read: vp_poc (Point of Control -- the price with the \
+heaviest recent traded volume) and the vp_va_low/vp_va_high Value Area bounds (70% of recent volume). \
+Price trading outside the Value Area suggests a move away from recent fair value (watch for a \
+pullback toward it); price inside it suggests range-bound "fair value" behavior. Use this for your \
+key_support/key_resistance picks when it's the nearest relevant level.
 - Your recommendation field is a technical-stance classification (BUY / SELL / HOLD), not \
 investment advice. Always include a risk_note.
 - Return ONLY valid JSON, no markdown fences, no preamble, matching exactly this schema:
@@ -1103,6 +1236,7 @@ def _attach_risk_bracket(insight: dict, indicators: dict) -> dict:
         insight["suggested_target"] = None
 
     insight.setdefault("structural_stop", indicators.get("supertrend"))
+    insight.setdefault("volume_profile_tip", indicators.get("volume_profile_tip"))
 
     levels = nearest_support_resistance(indicators)
     insight.setdefault("key_support", levels["support"])
@@ -1156,6 +1290,10 @@ def render_recommendation_card(insight: dict):
                 Structural Stop: <b style="color:#D93025;">{insight.get('structural_stop')}</b>
                 <span style="color:#9AA5B1;">(Supertrend line -- use if trailing a trend trade instead of a fixed ATR stop)</span>
             </div>''' if insight.get('structural_stop') is not None else ''}
+            {f'''<div style="margin-top: 10px; padding: 8px 10px; background: rgba(142,68,173,0.08);
+                 border-left: 3px solid #8E44AD; border-radius: 4px; color:#374151; font-size:0.92em;">
+                \U0001F4CA <b>Volume Profile:</b> {insight.get('volume_profile_tip')}
+            </div>''' if insight.get('volume_profile_tip') else ''}
             <div style="margin-top: 10px; color:#1f2937;">{insight.get('rationale', '')}</div>
             <div style="margin-top: 8px; font-style: italic; color: #6b7280; font-size: 0.9em;">
                 \u26A0\uFE0F Risk: {insight.get('risk_note', '')}
@@ -1191,6 +1329,8 @@ def render_indicator_grid(ind: dict):
         ("RSI Divergence", f"\u26A0\uFE0F {ind['rsi_divergence']}" if ind.get("rsi_divergence") else "None"),
         ("MACD Divergence", f"\u26A0\uFE0F {ind['macd_divergence']}" if ind.get("macd_divergence") else "None"),
         ("Anchored VWAP", f"{fmt(ind.get('vwap_anchored'))} (since {ind.get('vwap_anchor_date', 'n/a')})"),
+        ("Volume Profile POC", fmt(ind.get("vp_poc"))),
+        ("Value Area", f"{fmt(ind.get('vp_va_low'))} - {fmt(ind.get('vp_va_high'))}"),
     ]
     html = '<div class="aci-metric-grid">'
     for label, val in items:
