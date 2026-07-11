@@ -269,6 +269,37 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     swing_high = recent["High"].max()
     swing_low = recent["Low"].min()
 
+    # On-Balance Volume -- classic price-volume confirmation indicator:
+    # adds the day's volume when price closes up, subtracts it when price closes down.
+    if not vol.empty:
+        price_direction = np.sign(close.diff().fillna(0))
+        obv = (price_direction * vol.fillna(0)).cumsum()
+    else:
+        obv = pd.Series(dtype=float)
+
+    # 10-session OBV and price change, used to detect confirmation vs divergence
+    if not obv.empty and len(df) >= 11:
+        obv_change_10d = float(obv.iloc[-1] - obv.iloc[-11])
+        price_change_10d = float(close.iloc[-1] - close.iloc[-11])
+    else:
+        obv_change_10d = None
+        price_change_10d = None
+
+    # Fibonacci retracement levels from the same 60-day swing high/low used elsewhere
+    fib_diff = float(swing_high - swing_low)
+    if fib_diff > 0:
+        fib_levels = {
+            "fib_0.0": round(float(swing_high), 2),
+            "fib_23.6": round(float(swing_high - 0.236 * fib_diff), 2),
+            "fib_38.2": round(float(swing_high - 0.382 * fib_diff), 2),
+            "fib_50.0": round(float(swing_high - 0.5 * fib_diff), 2),
+            "fib_61.8": round(float(swing_high - 0.618 * fib_diff), 2),
+            "fib_78.6": round(float(swing_high - 0.786 * fib_diff), 2),
+            "fib_100.0": round(float(swing_low), 2),
+        }
+    else:
+        fib_levels = {}
+
     last_close = float(close.iloc[-1])
     vol_avg20 = float(vol.rolling(20).mean().iloc[-1]) if not vol.empty else None
     vol_last = float(vol.iloc[-1]) if not vol.empty else None
@@ -288,10 +319,15 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "swing_low_60d": round(float(swing_low), 2),
         "vol_last": vol_last,
         "vol_avg20": vol_avg20,
+        "obv_last": round(float(obv.iloc[-1]), 0) if not obv.empty else None,
+        "obv_change_10d": round(obv_change_10d, 0) if obv_change_10d is not None else None,
+        "price_change_10d": round(price_change_10d, 2) if price_change_10d is not None else None,
+        "fib_levels": fib_levels,
     }, {
         "sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower,
         "rsi": rsi14, "macd": macd, "macd_signal": signal, "macd_hist": macd - signal,
         "volume": vol, "vol_sma20": vol.rolling(20).mean() if not vol.empty else vol,
+        "obv": obv, "fib_levels": fib_levels,
     }
 
 
@@ -351,8 +387,34 @@ def rule_based_insight(indicators: dict) -> dict:
         elif band_pos <= 0.05:
             signals.append(("Price is testing the lower Bollinger Band", 1))
 
+    # OBV vs price trend over the last 10 sessions -- confirms or warns against the move
+    obv_change = indicators.get("obv_change_10d")
+    price_change = indicators.get("price_change_10d")
+    if obv_change is not None and price_change is not None and price_change != 0:
+        price_sign = 1 if price_change > 0 else -1
+        obv_sign = 1 if obv_change > 0 else (-1 if obv_change < 0 else 0)
+        direction_word = "up" if price_sign > 0 else "down"
+        if obv_sign == price_sign:
+            signals.append((f"OBV confirms the {direction_word}move (volume is backing the trend)", price_sign))
+        elif obv_sign == -price_sign:
+            signals.append((f"OBV is diverging from price (volume not confirming the {direction_word}move)", -price_sign))
+
+    # Fibonacci retracement proximity -- price testing an intermediate level as support/resistance
+    fib_levels = indicators.get("fib_levels") or {}
+    if fib_levels and last_close:
+        interior_levels = {k: v for k, v in fib_levels.items() if k not in ("fib_0.0", "fib_100.0")}
+        if interior_levels:
+            nearest_key, nearest_val = min(interior_levels.items(), key=lambda kv: abs(kv[1] - last_close))
+            tolerance = last_close * 0.015  # within 1.5% counts as "testing" the level
+            if abs(last_close - nearest_val) <= tolerance:
+                pct_label = nearest_key.replace("fib_", "") + "%"
+                if last_close >= nearest_val:
+                    signals.append((f"Price is testing Fibonacci {pct_label} level (~{nearest_val:g}) as support", 1))
+                else:
+                    signals.append((f"Price is testing Fibonacci {pct_label} level (~{nearest_val:g}) as resistance", -1))
+
     directions = [d for _, d in signals if d != 0]
-    score = sum(directions)
+    score = max(-5, min(5, sum(directions)))
 
     if score >= 2:
         recommendation = "Bullish"
@@ -404,12 +466,14 @@ def rule_based_insight(indicators: dict) -> dict:
 # ----------------------------------------------------------------------------
 
 def build_full_chart(df: pd.DataFrame, overlays: dict, title: str) -> go.Figure:
-    """4-panel chart: Price+SMA+Bollinger, Volume, MACD (line/signal/histogram), RSI."""
+    """5-indicator chart in 4 panels: Price+SMA+Bollinger+Fibonacci, Volume+OBV,
+    MACD (line/signal/histogram), RSI."""
     fig = make_subplots(
         rows=4, cols=1, shared_xaxes=True,
         row_heights=[0.46, 0.14, 0.20, 0.20],
         vertical_spacing=0.03,
-        subplot_titles=(None, "Volume", "MACD", "RSI"),
+        subplot_titles=(None, "Volume + OBV", "MACD", "RSI"),
+        specs=[[{"secondary_y": False}], [{"secondary_y": True}], [{"secondary_y": False}], [{"secondary_y": False}]],
     )
 
     # Row 1: Price + SMA + Bollinger Bands
@@ -427,13 +491,30 @@ def build_full_chart(df: pd.DataFrame, overlays: dict, title: str) -> go.Figure:
                               line=dict(color="rgba(150,150,150,0.5)", width=1, dash="dot"),
                               fill="tonexty", fillcolor="rgba(150,150,150,0.07)"), row=1, col=1)
 
-    # Row 2: Volume, colored by up/down day, with 20-day average line
+    # Row 1 (overlay): Fibonacci retracement levels from the 60-day swing high/low
+    fib_levels = overlays.get("fib_levels") or {}
+    fib_line_color = "rgba(148,0,211,0.55)"
+    for label, level in fib_levels.items():
+        pct_label = label.replace("fib_", "") + "%"
+        fig.add_hline(
+            y=level, line=dict(color=fib_line_color, width=1, dash="dot"),
+            annotation_text=f"Fib {pct_label} ({level:g})", annotation_position="right",
+            annotation_font_size=9, annotation_font_color=fib_line_color,
+            row=1, col=1,
+        )
+
+    # Row 2: Volume, colored by up/down day, with 20-day average line, plus OBV on secondary axis
     if "volume" in overlays and not overlays["volume"].empty:
         vol_colors = np.where(df["Close"] >= df["Open"], "rgba(11,102,35,0.55)", "rgba(178,34,34,0.55)")
         fig.add_trace(go.Bar(x=df.index, y=overlays["volume"], name="Volume",
-                              marker_color=vol_colors, showlegend=False), row=2, col=1)
+                              marker_color=vol_colors, showlegend=False), row=2, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=df.index, y=overlays["vol_sma20"], name="Vol SMA20",
-                                  line=dict(color="#555", width=1), showlegend=False), row=2, col=1)
+                                  line=dict(color="#555", width=1), showlegend=False), row=2, col=1, secondary_y=False)
+    if "obv" in overlays and not overlays["obv"].empty:
+        fig.add_trace(go.Scatter(x=df.index, y=overlays["obv"], name="OBV",
+                                  line=dict(color="#8B4513", width=1.3)), row=2, col=1, secondary_y=True)
+        fig.update_yaxes(title_text="OBV", row=2, col=1, secondary_y=True, showgrid=False)
+    fig.update_yaxes(title_text="Volume", row=2, col=1, secondary_y=False)
 
     # Row 3: MACD line, signal line, and histogram
     fig.add_trace(go.Scatter(x=df.index, y=overlays["macd"], name="MACD",
@@ -453,7 +534,7 @@ def build_full_chart(df: pd.DataFrame, overlays: dict, title: str) -> go.Figure:
     fig.update_yaxes(range=[0, 100], row=4, col=1)
 
     fig.update_layout(
-        title=title, xaxis_rangeslider_visible=False, height=880,
+        xaxis_rangeslider_visible=False, height=860,
         margin=dict(l=10, r=10, t=40, b=10), template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         bargap=0.1,
@@ -477,6 +558,10 @@ Rules:
 (e.g. uptrend/downtrend, consolidation, breakout above resistance, oversold/overbought, \
 moving average crossover, Bollinger squeeze). Do not force a pattern name if none fits -- \
 say the structure is unclear or range-bound instead.
+- If OBV (On-Balance Volume) data is given, note whether it confirms or diverges from the \
+price trend -- divergence (price moving one way, OBV the other) is a meaningful warning sign.
+- If Fibonacci retracement levels are given and price is within ~1.5% of one, note whether \
+it's acting as support or resistance.
 - Your recommendation field is a technical-stance classification, not investment advice. \
 Always include a risk_note.
 - The score field is a technical strength rating from -5 (strongly bearish setup) to +5 \
@@ -671,6 +756,45 @@ def _score_bar_html(score, color) -> str:
     """
 
 
+def render_price_header(asset_label: str, ticker: str, df: pd.DataFrame):
+    """Bold header shown above the chart: name, latest price + change (vs prior
+    session close), and the latest session's Open / High / Low."""
+    currency = "$" if ticker in ("GC=F", "SI=F") else "₹"
+
+    last_row = df.iloc[-1]
+    close_now = float(last_row["Close"])
+    prev_close = float(df["Close"].iloc[-2]) if len(df) >= 2 else close_now
+    change = close_now - prev_close
+    change_pct = (change / prev_close * 100) if prev_close else 0.0
+    color = "#0B6623" if change >= 0 else "#B22222"
+    sign = "+" if change >= 0 else ""
+    open_p = float(last_row["Open"])
+    high_p = float(last_row["High"])
+    low_p = float(last_row["Low"])
+
+    st.markdown(
+        f"""
+        <div style="margin-bottom:8px;">
+            <div style="font-size:1.25em;font-weight:800;">
+                {asset_label} <span style="font-weight:400;color:#888;font-size:0.7em;">({ticker})</span>
+            </div>
+            <div style="margin-top:2px;">
+                <span style="font-size:1.7em;font-weight:800;">{currency}{close_now:,.2f}</span>
+                <span style="font-size:1.15em;font-weight:800;color:{color};margin-left:12px;">
+                    {sign}{change:,.2f} ({sign}{change_pct:.2f}%)
+                </span>
+            </div>
+            <div style="margin-top:5px;color:#555;font-size:0.95em;">
+                Open: <b>{currency}{open_p:,.2f}</b> &nbsp;|&nbsp;
+                High: <b>{currency}{high_p:,.2f}</b> &nbsp;|&nbsp;
+                Low: <b>{currency}{low_p:,.2f}</b>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_recommendation_card(insight: dict):
     rec = insight.get("recommendation", "Watch")
     color = REC_COLORS.get(rec, "#555555")
@@ -777,6 +901,7 @@ def render_single_asset():
         )
 
         indicators, overlays = compute_indicators(df)
+        render_price_header(asset_label, ticker, df)
         fig = build_full_chart(df, overlays, f"{asset_label} ({ticker})")
         st.plotly_chart(fig, use_container_width=True)
 
