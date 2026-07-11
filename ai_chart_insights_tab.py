@@ -50,6 +50,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 import yfinance as yf
@@ -287,7 +288,11 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "swing_low_60d": round(float(swing_low), 2),
         "vol_last": vol_last,
         "vol_avg20": vol_avg20,
-    }, {"sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower}
+    }, {
+        "sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower,
+        "rsi": rsi14, "macd": macd, "macd_signal": signal, "macd_hist": macd - signal,
+        "volume": vol, "vol_sma20": vol.rolling(20).mean() if not vol.empty else vol,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -389,6 +394,8 @@ def rule_based_insight(indicators: dict) -> dict:
         "confidence": confidence,
         "rationale": rationale,
         "risk_note": risk_note,
+        "score": score,
+        "max_score": len(directions) if directions else 0,
     }
 
 
@@ -396,26 +403,63 @@ def rule_based_insight(indicators: dict) -> dict:
 # CHART
 # ----------------------------------------------------------------------------
 
-def build_candlestick_chart(df: pd.DataFrame, overlays: dict, title: str) -> go.Figure:
-    fig = go.Figure()
+def build_full_chart(df: pd.DataFrame, overlays: dict, title: str) -> go.Figure:
+    """4-panel chart: Price+SMA+Bollinger, Volume, MACD (line/signal/histogram), RSI."""
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True,
+        row_heights=[0.46, 0.14, 0.20, 0.20],
+        vertical_spacing=0.03,
+        subplot_titles=(None, "Volume", "MACD", "RSI"),
+    )
+
+    # Row 1: Price + SMA + Bollinger Bands
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
         name="Price", increasing_line_color="#0B6623", decreasing_line_color="#B22222",
-    ))
+    ), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=overlays["sma20"], name="SMA 20",
-                              line=dict(color="#1f77b4", width=1)))
+                              line=dict(color="#1f77b4", width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=overlays["sma50"], name="SMA 50",
-                              line=dict(color="#ff7f0e", width=1)))
+                              line=dict(color="#ff7f0e", width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=overlays["bb_upper"], name="BB Upper",
-                              line=dict(color="rgba(150,150,150,0.5)", width=1, dash="dot")))
+                              line=dict(color="rgba(150,150,150,0.5)", width=1, dash="dot")), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=overlays["bb_lower"], name="BB Lower",
                               line=dict(color="rgba(150,150,150,0.5)", width=1, dash="dot"),
-                              fill="tonexty", fillcolor="rgba(150,150,150,0.07)"))
+                              fill="tonexty", fillcolor="rgba(150,150,150,0.07)"), row=1, col=1)
+
+    # Row 2: Volume, colored by up/down day, with 20-day average line
+    if "volume" in overlays and not overlays["volume"].empty:
+        vol_colors = np.where(df["Close"] >= df["Open"], "rgba(11,102,35,0.55)", "rgba(178,34,34,0.55)")
+        fig.add_trace(go.Bar(x=df.index, y=overlays["volume"], name="Volume",
+                              marker_color=vol_colors, showlegend=False), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=overlays["vol_sma20"], name="Vol SMA20",
+                                  line=dict(color="#555", width=1), showlegend=False), row=2, col=1)
+
+    # Row 3: MACD line, signal line, and histogram
+    fig.add_trace(go.Scatter(x=df.index, y=overlays["macd"], name="MACD",
+                              line=dict(color="#1f77b4", width=1.3)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=overlays["macd_signal"], name="Signal",
+                              line=dict(color="#ff7f0e", width=1.3)), row=3, col=1)
+    hist = overlays["macd_hist"]
+    hist_colors = np.where(hist >= 0, "rgba(11,102,35,0.6)", "rgba(178,34,34,0.6)")
+    fig.add_trace(go.Bar(x=df.index, y=hist, name="Histogram",
+                          marker_color=hist_colors, showlegend=False), row=3, col=1)
+
+    # Row 4: RSI with overbought/oversold reference lines
+    fig.add_trace(go.Scatter(x=df.index, y=overlays["rsi"], name="RSI 14",
+                              line=dict(color="#7f2fb0", width=1.3), showlegend=False), row=4, col=1)
+    fig.add_hline(y=70, line=dict(color="rgba(178,34,34,0.5)", width=1, dash="dash"), row=4, col=1)
+    fig.add_hline(y=30, line=dict(color="rgba(11,102,35,0.5)", width=1, dash="dash"), row=4, col=1)
+    fig.update_yaxes(range=[0, 100], row=4, col=1)
+
     fig.update_layout(
-        title=title, xaxis_rangeslider_visible=False, height=520,
+        title=title, xaxis_rangeslider_visible=False, height=880,
         margin=dict(l=10, r=10, t=40, b=10), template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        bargap=0.1,
     )
+    # Only the bottom-most panel needs the range-slider-free x-axis labels visible;
+    # shared_xaxes already hides intermediate tick labels by default.
     return fig
 
 
@@ -435,6 +479,9 @@ moving average crossover, Bollinger squeeze). Do not force a pattern name if non
 say the structure is unclear or range-bound instead.
 - Your recommendation field is a technical-stance classification, not investment advice. \
 Always include a risk_note.
+- The score field is a technical strength rating from -5 (strongly bearish setup) to +5 \
+(strongly bullish setup), 0 being neutral, derived from how many of the given indicators \
+(trend, RSI, MACD, Bollinger position) agree and how strongly.
 - Return ONLY valid JSON, no markdown fences, no preamble, matching exactly this schema:
 
 {
@@ -444,6 +491,7 @@ Always include a risk_note.
   "key_resistance": number or null,
   "recommendation": "Bullish | Bearish | Neutral | Watch",
   "confidence": "High | Medium | Low",
+  "score": integer from -5 to 5,
   "rationale": "2-4 sentences explaining the read, referencing the specific indicator values given",
   "risk_note": "1-2 sentences on what would invalidate this read or key risk"
 }
@@ -591,9 +639,42 @@ REC_COLORS = {
 }
 
 
+def _score_bar_html(score, color) -> str:
+    """Renders a -5..+5 score as a small horizontal bar, filled proportionally
+    from the center. Returns empty string if no score is available."""
+    if score is None:
+        return ""
+    try:
+        score = max(-5, min(5, int(round(float(score)))))
+    except (TypeError, ValueError):
+        return ""
+    pct_from_center = abs(score) / 5 * 50  # each side of center is 50% of the bar width
+    if score >= 0:
+        bar = (
+            f'<div style="position:absolute;left:50%;width:{pct_from_center}%;height:100%;'
+            f'background:{color};border-radius:0 3px 3px 0;"></div>'
+        )
+    else:
+        bar = (
+            f'<div style="position:absolute;right:50%;width:{pct_from_center}%;height:100%;'
+            f'background:{color};border-radius:3px 0 0 3px;"></div>'
+        )
+    sign = "+" if score > 0 else ""
+    return f"""
+    <div style="margin-top:8px;">
+        <span style="font-size:0.85em;color:#666;">Technical Score: <b>{sign}{score} / 5</b></span>
+        <div style="position:relative;height:10px;background:#e6e6e6;border-radius:3px;margin-top:3px;">
+            <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#999;"></div>
+            {bar}
+        </div>
+    </div>
+    """
+
+
 def render_recommendation_card(insight: dict):
     rec = insight.get("recommendation", "Watch")
     color = REC_COLORS.get(rec, "#555555")
+    score_html = _score_bar_html(insight.get("score"), color)
     st.markdown(
         f"""
         <div style="border-left: 6px solid {color}; padding: 12px 16px;
@@ -612,6 +693,7 @@ def render_recommendation_card(insight: dict):
                 Support: {insight.get('key_support', 'n/a')} &nbsp;|&nbsp;
                 Resistance: {insight.get('key_resistance', 'n/a')}
             </div>
+            {score_html}
             <div style="margin-top: 8px;">{insight.get('rationale', '')}</div>
             <div style="margin-top: 8px; font-style: italic; color: #777; font-size: 0.9em;">
                 Risk: {insight.get('risk_note', '')}
@@ -695,7 +777,7 @@ def render_single_asset():
         )
 
         indicators, overlays = compute_indicators(df)
-        fig = build_candlestick_chart(df, overlays, f"{asset_label} ({ticker})")
+        fig = build_full_chart(df, overlays, f"{asset_label} ({ticker})")
         st.plotly_chart(fig, use_container_width=True)
 
         with st.expander("Latest technical snapshot"):
@@ -897,6 +979,7 @@ def render_watchlist():
                         "Trend": insight.get("trend"),
                         "Recommendation": insight.get("recommendation"),
                         "Confidence": insight.get("confidence"),
+                        "Score": insight.get("score"),
                         "Pattern": insight.get("pattern_identified"),
                         "Support": insight.get("key_support"),
                         "Resistance": insight.get("key_resistance"),
@@ -930,6 +1013,7 @@ def render_watchlist():
                 "Last Close": r.get("Last Close", "-"),
                 "Trend": r.get("Trend", r.get("Error", "-")),
                 "Recommendation": r.get("Recommendation", "-"),
+                "Score": r.get("Score", "-"),
                 "Confidence": r.get("Confidence", "-"),
                 "Support": r.get("Support", "-"),
                 "Resistance": r.get("Resistance", "-"),
@@ -937,6 +1021,10 @@ def render_watchlist():
             for r in results
         ]
         summary_df = pd.DataFrame(summary_rows)
+        if "Score" in summary_df.columns and pd.api.types.is_numeric_dtype(pd.to_numeric(summary_df["Score"], errors="coerce")):
+            summary_df = summary_df.iloc[
+                pd.to_numeric(summary_df["Score"], errors="coerce").fillna(-99).sort_values(ascending=False).index
+            ].reset_index(drop=True)
 
         def _color_rec(val):
             color = REC_COLORS.get(val)
