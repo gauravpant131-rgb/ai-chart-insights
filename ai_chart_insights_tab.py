@@ -466,14 +466,15 @@ def rule_based_insight(indicators: dict) -> dict:
 # ----------------------------------------------------------------------------
 
 def build_full_chart(df: pd.DataFrame, overlays: dict, title: str) -> go.Figure:
-    """5-indicator chart in 4 panels: Price+SMA+Bollinger+Fibonacci, Volume+OBV,
-    MACD (line/signal/histogram), RSI."""
+    """5-panel chart: Price+SMA+Bollinger+Fibonacci, Volume, OBV,
+    MACD (line/signal/histogram), RSI. Volume and OBV get their own panels --
+    sharing one panel on a secondary axis squashed the volume bars down to
+    near-invisible, since OBV's cumulative scale dwarfs raw volume."""
     fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True,
-        row_heights=[0.46, 0.14, 0.20, 0.20],
-        vertical_spacing=0.03,
-        subplot_titles=(None, "Volume + OBV", "MACD", "RSI"),
-        specs=[[{"secondary_y": False}], [{"secondary_y": True}], [{"secondary_y": False}], [{"secondary_y": False}]],
+        rows=5, cols=1, shared_xaxes=True,
+        row_heights=[0.38, 0.13, 0.13, 0.18, 0.18],
+        vertical_spacing=0.025,
+        subplot_titles=(None, "Volume", "OBV (On-Balance Volume)", "MACD", "RSI"),
     )
 
     # Row 1: Price + SMA + Bollinger Bands
@@ -503,38 +504,38 @@ def build_full_chart(df: pd.DataFrame, overlays: dict, title: str) -> go.Figure:
             row=1, col=1,
         )
 
-    # Row 2: Volume, colored by up/down day, with 20-day average line, plus OBV on secondary axis
+    # Row 2: Volume, colored by up/down day, with 20-day average line -- its own panel now
     if "volume" in overlays and not overlays["volume"].empty:
-        vol_colors = np.where(df["Close"] >= df["Open"], "rgba(11,102,35,0.55)", "rgba(178,34,34,0.55)")
+        vol_colors = np.where(df["Close"] >= df["Open"], "rgba(11,102,35,0.7)", "rgba(178,34,34,0.7)")
         fig.add_trace(go.Bar(x=df.index, y=overlays["volume"], name="Volume",
-                              marker_color=vol_colors, showlegend=False), row=2, col=1, secondary_y=False)
+                              marker_color=vol_colors, showlegend=False), row=2, col=1)
         fig.add_trace(go.Scatter(x=df.index, y=overlays["vol_sma20"], name="Vol SMA20",
-                                  line=dict(color="#555", width=1), showlegend=False), row=2, col=1, secondary_y=False)
+                                  line=dict(color="#333", width=1), showlegend=False), row=2, col=1)
+
+    # Row 3: OBV -- its own panel now, no longer squashed by sharing an axis with Volume
     if "obv" in overlays and not overlays["obv"].empty:
         fig.add_trace(go.Scatter(x=df.index, y=overlays["obv"], name="OBV",
-                                  line=dict(color="#8B4513", width=1.3)), row=2, col=1, secondary_y=True)
-        fig.update_yaxes(title_text="OBV", row=2, col=1, secondary_y=True, showgrid=False)
-    fig.update_yaxes(title_text="Volume", row=2, col=1, secondary_y=False)
+                                  line=dict(color="#8B4513", width=1.3), showlegend=False), row=3, col=1)
 
-    # Row 3: MACD line, signal line, and histogram
+    # Row 4: MACD line, signal line, and histogram
     fig.add_trace(go.Scatter(x=df.index, y=overlays["macd"], name="MACD",
-                              line=dict(color="#1f77b4", width=1.3)), row=3, col=1)
+                              line=dict(color="#1f77b4", width=1.3)), row=4, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=overlays["macd_signal"], name="Signal",
-                              line=dict(color="#ff7f0e", width=1.3)), row=3, col=1)
+                              line=dict(color="#ff7f0e", width=1.3)), row=4, col=1)
     hist = overlays["macd_hist"]
     hist_colors = np.where(hist >= 0, "rgba(11,102,35,0.6)", "rgba(178,34,34,0.6)")
     fig.add_trace(go.Bar(x=df.index, y=hist, name="Histogram",
-                          marker_color=hist_colors, showlegend=False), row=3, col=1)
+                          marker_color=hist_colors, showlegend=False), row=4, col=1)
 
-    # Row 4: RSI with overbought/oversold reference lines
+    # Row 5: RSI with overbought/oversold reference lines
     fig.add_trace(go.Scatter(x=df.index, y=overlays["rsi"], name="RSI 14",
-                              line=dict(color="#7f2fb0", width=1.3), showlegend=False), row=4, col=1)
-    fig.add_hline(y=70, line=dict(color="rgba(178,34,34,0.5)", width=1, dash="dash"), row=4, col=1)
-    fig.add_hline(y=30, line=dict(color="rgba(11,102,35,0.5)", width=1, dash="dash"), row=4, col=1)
-    fig.update_yaxes(range=[0, 100], row=4, col=1)
+                              line=dict(color="#7f2fb0", width=1.3), showlegend=False), row=5, col=1)
+    fig.add_hline(y=70, line=dict(color="rgba(178,34,34,0.5)", width=1, dash="dash"), row=5, col=1)
+    fig.add_hline(y=30, line=dict(color="rgba(11,102,35,0.5)", width=1, dash="dash"), row=5, col=1)
+    fig.update_yaxes(range=[0, 100], row=5, col=1)
 
     fig.update_layout(
-        xaxis_rangeslider_visible=False, height=860,
+        xaxis_rangeslider_visible=False, height=1000,
         margin=dict(l=10, r=10, t=40, b=10), template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         bargap=0.1,
