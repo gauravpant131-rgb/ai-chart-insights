@@ -80,6 +80,8 @@ RATE_LIMIT_BATCH_SIZE = 10       # extra pause after every N calls, to stay well
 RATE_LIMIT_BATCH_PAUSE_SECONDS = 6
 GEMINI_RATE_LIMIT_DELAY_SECONDS = 4.5  # Gemini free tier is ~15 RPM -- stay comfortably under that
 MAX_RETRIES = 3
+VOLUME_PROFILE_BINS = 24     # number of price levels in the volume profile histogram
+VOLUME_PROFILE_VALUE_AREA = 0.70  # fraction of total volume that defines the Value Area (industry standard is 70%)
 
 ASSET_PRESETS = {
     "Indian Stock": None,  # user types the symbol
@@ -231,6 +233,70 @@ def resolve_symbol_or_name(token: str, nse_df: pd.DataFrame) -> str:
 # TECHNICAL INDICATORS
 # ----------------------------------------------------------------------------
 
+def compute_volume_profile(df: pd.DataFrame, num_bins: int = VOLUME_PROFILE_BINS,
+                            value_area_pct: float = VOLUME_PROFILE_VALUE_AREA):
+    """Builds a volume-by-price histogram: divides the traded price range into
+    `num_bins` levels and distributes each session's volume across the bins its
+    High-Low range overlaps (proportional to overlap). Returns bin data plus:
+      - POC (Point of Control): the price level with the most traded volume
+      - Value Area High/Low: the tightest price band containing `value_area_pct`
+        of total volume, expanded outward from the POC bin
+    Returns None if there's no usable price/volume range (e.g. empty data)."""
+    if df.empty or "Volume" not in df.columns:
+        return None
+    highs = df["High"].to_numpy(dtype=float)
+    lows = df["Low"].to_numpy(dtype=float)
+    vols = df["Volume"].to_numpy(dtype=float)
+    price_min, price_max = float(lows.min()), float(highs.max())
+    if price_max <= price_min or vols.sum() <= 0:
+        return None
+
+    bin_edges = np.linspace(price_min, price_max, num_bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bin_volumes = np.zeros(num_bins)
+
+    for lo, hi, vol in zip(lows, highs, vols):
+        if hi <= lo:
+            idx = int(np.clip(np.searchsorted(bin_edges, lo) - 1, 0, num_bins - 1))
+            bin_volumes[idx] += vol
+            continue
+        overlap_start = np.maximum(bin_edges[:-1], lo)
+        overlap_end = np.minimum(bin_edges[1:], hi)
+        overlap = np.clip(overlap_end - overlap_start, 0, None)
+        total_overlap = overlap.sum()
+        if total_overlap > 0:
+            bin_volumes += vol * (overlap / total_overlap)
+
+    poc_idx = int(np.argmax(bin_volumes))
+    total_vol = float(bin_volumes.sum())
+
+    included = {poc_idx}
+    included_vol = bin_volumes[poc_idx]
+    left, right = poc_idx - 1, poc_idx + 1
+    while included_vol < value_area_pct * total_vol and (left >= 0 or right < num_bins):
+        left_vol = bin_volumes[left] if left >= 0 else -1.0
+        right_vol = bin_volumes[right] if right < num_bins else -1.0
+        if right_vol >= left_vol and right < num_bins:
+            included.add(right); included_vol += bin_volumes[right]; right += 1
+        elif left >= 0:
+            included.add(left); included_vol += bin_volumes[left]; left -= 1
+        else:
+            break
+
+    va_indices = sorted(included)
+    val_price = float(bin_edges[va_indices[0]])
+    vah_price = float(bin_edges[va_indices[-1] + 1])
+
+    return {
+        "bin_edges": bin_edges,
+        "bin_centers": bin_centers,
+        "bin_volumes": bin_volumes,
+        "poc_price": float(bin_centers[poc_idx]),
+        "vah_price": vah_price,
+        "val_price": val_price,
+    }
+
+
 def compute_indicators(df: pd.DataFrame) -> dict:
     close = df["Close"]
     high = df["High"]
@@ -304,6 +370,8 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     vol_avg20 = float(vol.rolling(20).mean().iloc[-1]) if not vol.empty else None
     vol_last = float(vol.iloc[-1]) if not vol.empty else None
 
+    volume_profile = compute_volume_profile(df)
+
     return {
         "last_close": round(last_close, 2),
         "sma20": round(float(sma20.iloc[-1]), 2) if not np.isnan(sma20.iloc[-1]) else None,
@@ -323,11 +391,14 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "obv_change_10d": round(obv_change_10d, 0) if obv_change_10d is not None else None,
         "price_change_10d": round(price_change_10d, 2) if price_change_10d is not None else None,
         "fib_levels": fib_levels,
+        "poc_price": round(volume_profile["poc_price"], 2) if volume_profile else None,
+        "vah_price": round(volume_profile["vah_price"], 2) if volume_profile else None,
+        "val_price": round(volume_profile["val_price"], 2) if volume_profile else None,
     }, {
         "sma20": sma20, "sma50": sma50, "bb_upper": bb_upper, "bb_lower": bb_lower,
         "rsi": rsi14, "macd": macd, "macd_signal": signal, "macd_hist": macd - signal,
         "volume": vol, "vol_sma20": vol.rolling(20).mean() if not vol.empty else vol,
-        "obv": obv, "fib_levels": fib_levels,
+        "obv": obv, "fib_levels": fib_levels, "volume_profile": volume_profile,
     }
 
 
@@ -412,6 +483,18 @@ def rule_based_insight(indicators: dict) -> dict:
                     signals.append((f"Price is testing Fibonacci {pct_label} level (~{nearest_val:g}) as support", 1))
                 else:
                     signals.append((f"Price is testing Fibonacci {pct_label} level (~{nearest_val:g}) as resistance", -1))
+
+    # Volume Profile Value Area -- price breaking above/below the high-volume zone
+    poc = indicators.get("poc_price")
+    vah = indicators.get("vah_price")
+    val = indicators.get("val_price")
+    if vah is not None and val is not None and last_close is not None:
+        if last_close > vah:
+            signals.append((f"Price is above the Value Area High (~{vah:g}) -- outside the high-volume zone, potential breakout", 1))
+        elif last_close < val:
+            signals.append((f"Price is below the Value Area Low (~{val:g}) -- outside the high-volume zone, potential breakdown", -1))
+        else:
+            signals.append((f"Price is trading inside the Value Area ({val:g}-{vah:g}), near the high-volume zone", 0))
 
     directions = [d for _, d in signals if d != 0]
     score = max(-5, min(5, sum(directions)))
@@ -504,6 +587,44 @@ def build_full_chart(df: pd.DataFrame, overlays: dict, title: str) -> go.Figure:
             row=1, col=1,
         )
 
+    # Row 1 (inset, right edge): Volume Profile -- horizontal histogram of volume by
+    # price level, with POC (Point of Control) line and shaded Value Area.
+    vp = overlays.get("volume_profile")
+    price_yaxis = fig.data[0].yaxis or "y"  # the Price trace's yaxis, e.g. "y"
+    if vp is not None:
+        main_domain = [0.0, 0.84]
+        vp_domain = [0.86, 1.0]
+        for r in range(1, 6):
+            fig.update_xaxes(domain=main_domain, row=r, col=1)
+
+        vp_xaxis_num = 6  # rows 1-5 already own xaxis..xaxis5; this is the 6th
+        bin_width = float(vp["bin_edges"][1] - vp["bin_edges"][0])
+        fig.add_trace(go.Bar(
+            x=vp["bin_volumes"], y=vp["bin_centers"], orientation="h",
+            width=bin_width * 0.9, name="Volume Profile", showlegend=False,
+            marker_color="rgba(70,130,180,0.45)",
+            xaxis=f"x{vp_xaxis_num}", yaxis=price_yaxis,
+            hovertemplate="Price %{y:.2f}<br>Volume %{x:,.0f}<extra></extra>",
+        ))
+        fig.update_layout(**{
+            f"xaxis{vp_xaxis_num}": dict(
+                domain=vp_domain, anchor=price_yaxis, showgrid=False,
+                showticklabels=False, zeroline=False,
+            )
+        })
+
+        fig.add_hline(
+            y=vp["poc_price"], line=dict(color="rgba(255,140,0,0.9)", width=1.4),
+            annotation_text=f"POC {vp['poc_price']:g}", annotation_position="left",
+            annotation_font_size=9, annotation_font_color="rgba(200,110,0,0.9)",
+            row=1, col=1,
+        )
+        fig.add_hrect(
+            y0=vp["val_price"], y1=vp["vah_price"],
+            fillcolor="rgba(70,130,180,0.07)", line_width=0,
+            row=1, col=1,
+        )
+
     # Row 2: Volume, colored by up/down day, with 20-day average line -- its own panel now
     if "volume" in overlays and not overlays["volume"].empty:
         vol_colors = np.where(df["Close"] >= df["Open"], "rgba(11,102,35,0.7)", "rgba(178,34,34,0.7)")
@@ -563,6 +684,8 @@ say the structure is unclear or range-bound instead.
 price trend -- divergence (price moving one way, OBV the other) is a meaningful warning sign.
 - If Fibonacci retracement levels are given and price is within ~1.5% of one, note whether \
 it's acting as support or resistance.
+- If a Volume Profile POC (Point of Control) and Value Area High/Low are given, note whether \
+price is inside the high-volume Value Area (consolidation) or has broken above/below it.
 - Your recommendation field is a technical-stance classification, not investment advice. \
 Always include a risk_note.
 - The score field is a technical strength rating from -5 (strongly bearish setup) to +5 \
